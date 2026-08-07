@@ -1,0 +1,19 @@
+{
+  "mcpServers": {
+    "colab": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "C:\\absolute\\path\\to\\colab-mcp",
+        "run",
+        "colab-mcp",
+        "serve"
+      ],
+      "env": {
+        "COLAB_MCP_AUTH": "oauth2",
+        "COLAB_MCP_KEEPALIVE_SECONDS": "60"
+      },
+      "timeout": 30000
+    }
+  }
+}
