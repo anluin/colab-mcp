@@ -1,6 +1,6 @@
 # Colab MCP
 
-Give Codex and other MCP clients access to general-purpose Google Colab CPU/GPU runtimes from Windows, macOS, or Linux. The server uses standard MCP over stdio and does not require WSL, SSH, an open Colab browser tab, or Colab Enterprise.
+Give Codex, Grok, Claude, and other MCP clients access to general-purpose Google Colab CPU/GPU runtimes from Windows, macOS, or Linux. The server uses standard MCP over stdio and does not require WSL, SSH, an open Colab browser tab, or Colab Enterprise.
 
 ## Quick setup for Codex
 
@@ -34,10 +34,28 @@ Then give the agent this exact smoke task:
 
 Expected evidence is a non-empty `gpu` list, a zero command exit code, and a final stopped session.
 
+## Quick setup for Grok
+
+Prerequisites: [Git](https://git-scm.com/), [uv](https://docs.astral.sh/uv/getting-started/installation/), and the [Grok CLI](https://grok.x.ai/) (`grok` on `PATH`).
+
+```bash
+git clone https://github.com/anluin/colab-mcp.git
+cd colab-mcp
+uv run colab-mcp setup grok
+```
+
+This authenticates with Google Colab once (if needed) and registers the stdio server through
+`grok mcp add` into `~/.grok/config.toml`. Grok uses an isolated `uv` environment so it does not
+share the repository environment with a long-running Codex or other client session—important on
+Windows, where a locked console-script entry point can prevent a second `uv run` from starting.
+
+Restart Grok after setup, open `/mcps`, and call `colab_health` (tools appear as
+`colab__colab_health` after namespacing). Confirm connectivity with `grok mcp doctor colab`.
+
 The same CLI can configure multiple clients in one human-run step:
 
 ```bash
-uv run colab-mcp setup codex claude-desktop
+uv run colab-mcp setup codex grok claude-desktop
 ```
 
 Or run the steps separately:
@@ -45,16 +63,17 @@ Or run the steps separately:
 ```bash
 uv run colab-mcp auth
 uv run colab-mcp install codex
+uv run colab-mcp install grok
 uv run colab-mcp install claude
 uv run colab-mcp install claude-desktop
 uv run colab-mcp doctor
 uv run colab-mcp doctor --live
 ```
 
-Claude Desktop is registered with an isolated `uv` environment, so it can update or restart while
-Codex continues using the repository environment for a long-running session. On Windows, setup
-detects both the conventional `%APPDATA%` configuration and Microsoft Store's virtualized Claude
-configuration, preferring the active packaged configuration when present.
+Claude Desktop and Grok are registered with an isolated `uv` environment, so they can update or
+restart while Codex continues using the repository environment for a long-running session. On
+Windows, Claude Desktop setup detects both the conventional `%APPDATA%` configuration and Microsoft
+Store's virtualized Claude configuration, preferring the active packaged configuration when present.
 
 Only `auth` and `setup` may prompt for Google authorization. `serve` is strictly non-interactive: if credentials expire and cannot refresh, it instructs the human to rerun `colab-mcp auth` and never launches OAuth inside an agent session.
 `doctor --live` performs a read-only assignments API check and reports only the count, never

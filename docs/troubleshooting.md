@@ -11,9 +11,14 @@ account and authenticate again.
 
 ## Client does not show tools
 
-Run `uv run colab-mcp install codex --force` (or `claude`) and restart that client. Confirm `uv` and
-the repository path still exist. `uv run --locked colab-mcp serve` should remain silent while it
-waits for MCP messages; ordinary stdout logging would corrupt stdio framing.
+Run `uv run colab-mcp install codex --force` (or `grok`, `claude`, `claude-desktop`) and restart that
+client. Confirm `uv` and the repository path still exist. `uv run --locked colab-mcp serve` should
+remain silent while it waits for MCP messages; ordinary stdout logging would corrupt stdio framing.
+
+For Grok, also run `grok mcp doctor colab`. On Windows, if doctor reports a failed handshake with a
+locked `colab-mcp.exe` under the project `.venv`, reinstall with
+`uv run colab-mcp install grok --force` so Grok keeps its isolated environment and does not compete
+with another client holding the project console-script entry point.
 
 ## Runtime is stale or quota appears occupied
 

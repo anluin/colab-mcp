@@ -10,6 +10,7 @@ import pytest
 from colab_cli.state import SessionState
 
 from src.cli import (
+    _client_has_server,
     claude_desktop_config_path,
     config_json,
     install_claude_desktop,
@@ -114,6 +115,22 @@ def test_claude_registration_uses_user_scoped_stdio(tmp_path: Path):
     assert command[-6:] == ["--directory", str(tmp_path), "run", "--locked", "colab-mcp", "serve"]
 
 
+def test_grok_registration_uses_isolated_user_scope(tmp_path: Path):
+    command = install_command("grok", "grok", "uv", tmp_path, "colab")
+    assert command[:6] == ["grok", "mcp", "add", "--scope", "user", "colab"]
+    assert "-e" in command
+    assert "COLAB_MCP_AUTH=oauth2" in command
+    assert command[-7:] == [
+        "--directory",
+        str(tmp_path),
+        "run",
+        "--isolated",
+        "--locked",
+        "colab-mcp",
+        "serve",
+    ]
+
+
 def test_generic_json_config(tmp_path: Path):
     text = config_json("uv", tmp_path)
     assert '"colab"' in text
@@ -186,6 +203,30 @@ def test_claude_desktop_install_preserves_existing_config(tmp_path: Path, monkey
     )
     assert "--isolated" in result["mcpServers"]["colab"]["args"]
     assert "Restart Claude Desktop" in capsys.readouterr().out
+
+
+def test_client_has_server_parses_grok_list_json(monkeypatch: pytest.MonkeyPatch):
+    class Result:
+        returncode = 0
+        stdout = json.dumps(
+            [
+                {
+                    "name": "colab",
+                    "scope": "user",
+                    "command": "uv",
+                    "args": ["run", "colab-mcp", "serve"],
+                    "enabled": True,
+                }
+            ]
+        )
+
+    def fake_run(command, **_kwargs):
+        assert command[:3] == ["grok", "mcp", "list"]
+        return Result()
+
+    monkeypatch.setattr("src.cli.subprocess.run", fake_run)
+    assert _client_has_server("grok", "grok", "colab")
+    assert not _client_has_server("grok", "grok", "other")
 
 
 def test_server_credentials_never_prompt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

@@ -35,6 +35,23 @@ def isolated_server_command(uv: str, project: Path) -> list[str]:
 
 
 def install_command(client: str, executable: str, uv: str, project: Path, name: str) -> list[str]:
+    # Grok shares the host with other MCP clients (often Codex). Use an isolated
+    # uv environment so a long-running project-env session cannot lock Windows
+    # console-script entry points and break Grok startup.
+    if client == "grok":
+        server = isolated_server_command(uv, project)
+        return [
+            executable,
+            "mcp",
+            "add",
+            "--scope",
+            "user",
+            name,
+            "-e",
+            "COLAB_MCP_AUTH=oauth2",
+            "--",
+            *server,
+        ]
     server = server_command(uv, project)
     if client == "codex":
         return [
@@ -87,6 +104,29 @@ def _run(command: list[str], *, check: bool = True) -> subprocess.CompletedProce
 
 def _project() -> Path:
     return Path(__file__).resolve().parents[1]
+
+
+def _client_has_server(executable: str, client: str, name: str) -> bool:
+    """Return True when the named MCP server is already registered with the client."""
+    if client == "grok":
+        # Grok has no `mcp get`; use machine-readable list instead.
+        listed = subprocess.run(
+            [executable, "mcp", "list", "--json"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if listed.returncode != 0:
+            return False
+        try:
+            payload = json.loads(listed.stdout)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, list):
+            return False
+        return any(isinstance(item, dict) and item.get("name") == name for item in payload)
+    existing = _run([executable, "mcp", "get", name], check=False)
+    return existing.returncode == 0
 
 
 def claude_desktop_config_path(
@@ -163,14 +203,18 @@ def install(client: str, name: str, force: bool) -> None:
     executable = shutil.which(client)
     if not executable:
         raise SystemExit(f"{client!r} was not found on PATH")
-    existing = _run([executable, "mcp", "get", name], check=False)
-    if existing.returncode == 0:
+    if _client_has_server(executable, client, name):
         if not force:
             print(f"MCP server {name!r} is already registered with {client}; nothing changed.")
             return
         _run([executable, "mcp", "remove", name])
     _run(install_command(client, executable, uv, project, name))
-    print(f"Registered MCP server {name!r} with {client}. Restart the client, then run /mcp.")
+    restart_hint = {
+        "grok": "Restart Grok, open /mcps, and call colab_health.",
+        "codex": "Restart the client, then run /mcp.",
+        "claude": "Restart the client, then run /mcp.",
+    }.get(client, "Restart the client, then run /mcp.")
+    print(f"Registered MCP server {name!r} with {client}. {restart_hint}")
 
 
 def doctor(live: bool = False) -> None:
@@ -180,7 +224,9 @@ def doctor(live: bool = False) -> None:
         "uv": shutil.which("uv"),
         "codex": shutil.which("codex"),
         "claude": shutil.which("claude"),
+        "grok": shutil.which("grok"),
         "server_command": server_command(_uv(), _project()),
+        "isolated_server_command": isolated_server_command(_uv(), _project()),
         "colab_mcp_version": COLAB_MCP_VERSION,
         "google_colab_cli_version": COLAB_CLI_VERSION,
         "python_compatible": True,
@@ -213,14 +259,18 @@ def main() -> None:
     commands.add_parser("serve", help="Run the non-interactive MCP stdio server")
 
     install_parser = commands.add_parser("install", help="Register with an MCP client")
-    install_parser.add_argument("client", choices=["codex", "claude", "claude-desktop", "json"])
+    install_parser.add_argument(
+        "client", choices=["codex", "claude", "claude-desktop", "grok", "json"]
+    )
     install_parser.add_argument("--name", default="colab")
     install_parser.add_argument("--force", action="store_true")
 
     setup_parser = commands.add_parser(
         "setup", help="Authenticate and register one or more clients"
     )
-    setup_parser.add_argument("clients", nargs="+", choices=["codex", "claude", "claude-desktop"])
+    setup_parser.add_argument(
+        "clients", nargs="+", choices=["codex", "claude", "claude-desktop", "grok"]
+    )
     setup_parser.add_argument("--name", default="colab")
     setup_parser.add_argument("--force", action="store_true")
 

@@ -6,6 +6,7 @@
         "--directory",
         "C:\\absolute\\path\\to\\colab-mcp",
         "run",
+        "--locked",
         "colab-mcp",
         "serve"
       ],
