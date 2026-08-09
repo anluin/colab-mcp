@@ -32,6 +32,11 @@ ephemeral backend (or the session predates incarnation tracking). Do not retry o
 interpret an empty `/content` as the old runtime. Stop the stale session, start a new one, and
 restore files from durable local storage.
 
+Process tools return a lost-process record when local metadata exists but the remote record does
+not. Inspect `last_known_process` and `diagnostic.probable_cause`; common causes are Colab runtime
+recycling, runtime OOM/reset, or deleted remote process state. This is diagnostic evidence, not a
+guaranteed root-cause determination.
+
 ## Commands time out or the kernel disappears
 
 Prefer `colab_process_start` for long work. Poll status and output, and signal it when needed. A

@@ -116,6 +116,10 @@ class RuntimeReplacedError(RemoteOperationError):
 
     code = "runtime_replaced"
 
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        self.details = details or {"code": self.code, "message": message}
+        super().__init__(message)
+
 
 def validate_argv(argv: list[str]) -> None:
     if not argv or any(not isinstance(value, str) or not value for value in argv):

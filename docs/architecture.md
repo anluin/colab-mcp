@@ -24,6 +24,10 @@ Allocation also persists a random incarnation fingerprint in local session state
 under the assigned backend's `/content`. The common remote-operation envelope validates the marker
 before process, filesystem, transfer, or introspection code runs. A missing or different marker is
 reported as `runtime_replaced`; it is never interpreted as an empty filesystem or missing process.
+Process observations are journaled in owner-only local state. A fingerprint mismatch is persisted
+on the session, making subsequent operations fail before kernel access. Process APIs can therefore
+return the last observation with `status="lost"` and a probable-cause diagnostic even when the
+replacement backend no longer contains `.colab-mcp/processes`.
 
 The server does not expose a network listener. MCP request boundaries do not bound remote process
 lifetime; detached process state and output are polled in later requests. A runner continuously

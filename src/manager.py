@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import datetime
 import hashlib
 import json
 import logging
@@ -50,6 +51,8 @@ class ManagedSessionState(SessionState):
     """Persisted assignment ownership plus this backend incarnation's marker."""
 
     runtime_fingerprint: str | None = None
+    runtime_replaced_at: str | None = None
+    runtime_replaced_reason: str | None = None
 
 
 def _secure_permissions(path: Path, mode: int, platform: str = os.name) -> None:
@@ -79,6 +82,59 @@ class SecureStateStore(StateStore):
     def remove(self, name: str) -> None:
         super().remove(name)
         _secure_permissions(Path(self.path), 0o600)
+
+
+class ProcessJournal:
+    """Persist last-known managed-process state outside the ephemeral runtime."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def _read(self) -> dict[str, dict[str, dict[str, Any]]]:
+        if not self.path.exists():
+            return {}
+        try:
+            value = json.loads(self.path.read_text(encoding="utf-8"))
+            return value if isinstance(value, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _write(self, records: dict[str, dict[str, dict[str, Any]]]) -> None:
+        temporary = self.path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records, indent=2), encoding="utf-8")
+        _secure_permissions(temporary, 0o600)
+        temporary.replace(self.path)
+        _secure_permissions(self.path, 0o600)
+
+    def update(self, session: str, process: dict[str, Any]) -> dict[str, Any]:
+        process_id = str(process["process_id"])
+        with self._lock:
+            records = self._read()
+            previous = records.setdefault(session, {}).get(process_id, {})
+            current = {
+                **previous,
+                **process,
+                "process_id": process_id,
+                "last_observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+            records[session][process_id] = current
+            self._write(records)
+            return current
+
+    def get(self, session: str, process_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return self._read().get(session, {}).get(process_id)
+
+    def list(self, session: str) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._read().get(session, {}).values())
+
+    def remove_session(self, session: str) -> None:
+        with self._lock:
+            records = self._read()
+            if records.pop(session, None) is not None:
+                self._write(records)
 
 
 def require_local_file(path: str) -> Path:
@@ -194,6 +250,7 @@ class ColabManager:
         config_dir.mkdir(parents=True, exist_ok=True)
         _secure_permissions(config_dir, 0o700)
         self.store = SecureStateStore(str(config_dir / "sessions.json"))
+        self.process_journal = ProcessJournal(config_dir / "processes.json")
         self.suspended_path = config_dir / "suspended.json"
         self._suspended_lock = threading.Lock()
         self.auth_provider = AuthProvider(os.environ.get("COLAB_MCP_AUTH", "oauth2"))
@@ -383,6 +440,7 @@ class ColabManager:
                 if task:
                     task.cancel()
                 self.store.remove(item["session"])
+                self.process_journal.remove_session(item["session"])
                 forgotten.append(item["session"])
         if release_orphans:
             for endpoint in orphans:
@@ -483,31 +541,85 @@ class ColabManager:
         session = self.resolve(name)
         fingerprint = getattr(session, "runtime_fingerprint", None)
         if not fingerprint:
-            raise RuntimeReplacedError(
-                f"runtime_replaced: session {session.name!r} has no verifiable runtime "
-                "incarnation; stop it and start a new session"
+            raise self._replacement_error(
+                session,
+                "session has no verifiable runtime incarnation; stop it and start a new session",
+                payload.get("process_id"),
+            )
+        if getattr(session, "runtime_replaced_at", None):
+            raise self._replacement_error(
+                session,
+                session.runtime_replaced_reason or "runtime fingerprint previously changed",
+                payload.get("process_id"),
             )
         payload = {**payload, "runtime_fingerprint": fingerprint}
         code = build_remote_code(operation, payload)
         try:
-            outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-        except (TimeoutError, OSError):
-            retryable = {
-                "process_status",
-                "process_list",
-                "process_output",
-                "fs_list",
-                "fs_stat",
-                "fs_read",
-                "inspect",
-            }
-            if operation not in retryable:
-                raise
-            session.kernel_id = None
+            try:
+                outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
+            except (TimeoutError, OSError):
+                retryable = {
+                    "process_status",
+                    "process_list",
+                    "process_output",
+                    "fs_list",
+                    "fs_stat",
+                    "fs_read",
+                    "inspect",
+                }
+                if operation not in retryable:
+                    raise
+                session.kernel_id = None
+                self.store.add(session)
+                logger.warning("kernel_reconnect_retry operation=%s session=%s", operation, name)
+                outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
+            return parse_remote_result(outputs)
+        except RuntimeReplacedError as error:
+            session.runtime_replaced_at = datetime.datetime.now(datetime.UTC).isoformat()
+            session.runtime_replaced_reason = str(error)
             self.store.add(session)
-            logger.warning("kernel_reconnect_retry operation=%s session=%s", operation, name)
-            outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-        return parse_remote_result(outputs)
+            logger.warning("runtime_replaced session=%s operation=%s", session.name, operation)
+            raise self._replacement_error(session, str(error), payload.get("process_id")) from error
+
+    def _replacement_error(
+        self, session: SessionState, reason: str, process_id: str | None = None
+    ) -> RuntimeReplacedError:
+        last_known = self.process_journal.get(session.name, process_id) if process_id else None
+        details = {
+            "code": "runtime_replaced",
+            "session": session.name,
+            "process_id": process_id,
+            "probable_cause": "colab_runtime_recycle_or_runtime_oom",
+            "message": reason,
+            "last_known_process": last_known,
+        }
+        return RuntimeReplacedError(
+            "runtime_replaced: " + json.dumps(details, separators=(",", ":")), details
+        )
+
+    def _lost_process(
+        self,
+        session: SessionState,
+        process_id: str,
+        code: str,
+        message: str,
+    ) -> dict[str, Any]:
+        last_known = self.process_journal.get(session.name, process_id)
+        return {
+            **(last_known or {"process_id": process_id}),
+            "process_id": process_id,
+            "status": "lost",
+            "last_known_process": last_known,
+            "diagnostic": {
+                "code": code,
+                "probable_cause": (
+                    "colab_runtime_recycle_or_runtime_oom"
+                    if code == "runtime_replaced"
+                    else "remote_process_state_lost_or_runtime_oom"
+                ),
+                "message": message,
+            },
+        }
 
     async def run_command(
         self,
@@ -577,14 +689,49 @@ class ColabManager:
             },
             name,
         )
+        session = self.resolve(name)
+        self.process_journal.update(
+            session.name,
+            {
+                **result,
+                "session": session.name,
+                "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+            },
+        )
         logger.info("process_started session=%s process_id=%s", name, result["process_id"])
         return result
 
     async def process_status(self, process_id: str, name: str | None) -> dict[str, Any]:
-        return await self._remote_operation("process_status", {"process_id": process_id}, name)
+        session = self.resolve(name)
+        try:
+            result = await self._remote_operation(
+                "process_status", {"process_id": process_id}, session.name
+            )
+        except RuntimeReplacedError as error:
+            return self._lost_process(
+                session, process_id, error.code, error.details.get("message", str(error))
+            )
+        except RemoteOperationError as error:
+            if not str(error).startswith("FileNotFoundError: Unknown process_id:"):
+                raise
+            return self._lost_process(session, process_id, "process_state_lost", str(error))
+        return self.process_journal.update(session.name, result)
 
     async def process_list(self, name: str | None) -> list[dict[str, Any]]:
-        return await self._remote_operation("process_list", {}, name)
+        session = self.resolve(name)
+        try:
+            result = await self._remote_operation("process_list", {}, session.name)
+        except RuntimeReplacedError as error:
+            return [
+                self._lost_process(
+                    session,
+                    item["process_id"],
+                    error.code,
+                    error.details.get("message", str(error)),
+                )
+                for item in self.process_journal.list(session.name)
+            ]
+        return [self.process_journal.update(session.name, item) for item in result]
 
     async def process_output(
         self,
@@ -599,20 +746,69 @@ class ColabManager:
         if offset < 0:
             raise ValueError("offset must be zero or greater")
         limit = validate_output_limit(limit)
-        return await self._remote_operation(
-            "process_output",
-            {"process_id": process_id, "stream": stream, "offset": offset, "limit": limit},
-            name,
+        session = self.resolve(name)
+        try:
+            result = await self._remote_operation(
+                "process_output",
+                {"process_id": process_id, "stream": stream, "offset": offset, "limit": limit},
+                session.name,
+            )
+        except RuntimeReplacedError as error:
+            lost = self._lost_process(
+                session, process_id, error.code, error.details.get("message", str(error))
+            )
+            return {
+                **lost,
+                "stream": stream,
+                "offset": offset,
+                "next_offset": offset,
+                "data": "",
+                "more_available": False,
+                "eof": True,
+            }
+        except RemoteOperationError as error:
+            if not str(error).startswith("FileNotFoundError: Unknown process_id:"):
+                raise
+            lost = self._lost_process(session, process_id, "process_state_lost", str(error))
+            return {
+                **lost,
+                "stream": stream,
+                "offset": offset,
+                "next_offset": offset,
+                "data": "",
+                "more_available": False,
+                "eof": True,
+            }
+        self.process_journal.update(
+            session.name,
+            {
+                "process_id": process_id,
+                "status": result["status"],
+                f"{stream}_next_offset": result["next_offset"],
+            },
         )
+        return result
 
     async def process_signal(
         self, process_id: str, name: str | None, signal: str = "TERM"
     ) -> dict[str, Any]:
         if signal not in {"TERM", "KILL", "INT"}:
             raise ValueError("signal must be TERM, KILL, or INT")
-        return await self._remote_operation(
-            "process_signal", {"process_id": process_id, "signal": signal}, name
-        )
+        session = self.resolve(name)
+        try:
+            result = await self._remote_operation(
+                "process_signal", {"process_id": process_id, "signal": signal}, session.name
+            )
+        except RuntimeReplacedError as error:
+            return self._lost_process(
+                session, process_id, error.code, error.details.get("message", str(error))
+            )
+        except RemoteOperationError as error:
+            if not str(error).startswith("FileNotFoundError: Unknown process_id:"):
+                raise
+            return self._lost_process(session, process_id, "process_state_lost", str(error))
+        self.process_journal.update(session.name, {"process_id": process_id, **result})
+        return result
 
     async def filesystem_list(
         self, path: str, name: str | None, limit: int = 1_000
@@ -943,6 +1139,7 @@ class ColabManager:
         if was_active:
             await asyncio.to_thread(self.client().unassign, session.endpoint)
         self.store.remove(session.name)
+        self.process_journal.remove_session(session.name)
         logger.info("runtime_released session=%s was_active=%s", session.name, was_active)
         return {"stopped": session.name, "runtime_was_active": was_active}
 

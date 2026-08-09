@@ -36,6 +36,11 @@ def stream_result(result: object) -> list[dict]:
     return [{"output_type": "stream", "text": f"noise\n{RESULT_PREFIX}{payload}\n"}]
 
 
+def stream_error(error_type: str, message: str) -> list[dict]:
+    payload = json.dumps({"ok": False, "error": {"type": error_type, "message": message}})
+    return [{"output_type": "stream", "text": RESULT_PREFIX + payload}]
+
+
 def test_remote_payload_is_encoded_not_interpolated():
     dangerous = "'\"; raise RuntimeError('injected')"
     code = build_remote_code(
@@ -281,13 +286,30 @@ def test_run_command_request_cancellation_does_not_signal_process(tmp_path, monk
 
 def test_process_operations_cross_request_boundaries(tmp_path, monkeypatch):
     instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+    )
     operations = []
 
     async def fake_remote(operation, payload, name, timeout=120):
         operations.append((operation, payload, name, timeout))
+        if operation == "process_output":
+            return {
+                "operation": operation,
+                "process_id": payload["process_id"],
+                "status": "running",
+                "next_offset": payload["offset"],
+            }
         return {
             "operation": operation,
-            **({"process_id": payload["process_id"]} if operation == "process_start" else {}),
+            "process_id": payload["process_id"],
+            **({"status": "running"} if operation == "process_status" else {}),
         }
 
     instance._remote_operation = fake_remote
@@ -467,3 +489,105 @@ def test_remote_operation_injects_persisted_fingerprint(tmp_path, monkeypatch):
     instance.execute = execute
     asyncio.run(instance._remote_operation("fs_list", {"path": "/content"}, "runtime"))
     assert captured["payload"]["runtime_fingerprint"] == "b" * 32
+
+
+def test_replaced_runtime_returns_last_process_metadata_and_then_fails_fast(tmp_path, monkeypatch):
+    instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+    )
+    instance.process_journal.update(
+        "runtime",
+        {
+            "process_id": "process-1",
+            "argv": ["python", "job.py"],
+            "cwd": "/content/project",
+            "status": "running",
+            "pid": 123,
+        },
+    )
+    calls = []
+
+    async def execute(*_args, **_kwargs):
+        calls.append(True)
+        return stream_error(
+            "RuntimeReplacedError",
+            "runtime_replaced: expected incarnation a, observed missing",
+        )
+
+    instance.execute = execute
+    first = asyncio.run(instance.process_status("process-1", "runtime"))
+    second = asyncio.run(instance.process_status("process-1", "runtime"))
+
+    assert len(calls) == 1
+    assert first["status"] == second["status"] == "lost"
+    assert first["last_known_process"]["argv"] == ["python", "job.py"]
+    assert first["last_known_process"]["cwd"] == "/content/project"
+    assert first["diagnostic"]["code"] == "runtime_replaced"
+    assert first["diagnostic"]["probable_cause"] == "colab_runtime_recycle_or_runtime_oom"
+    recovered = instance.store.get("runtime")
+    assert recovered.runtime_replaced_at is not None
+
+
+def test_file_operations_fail_fast_after_first_fingerprint_mismatch(tmp_path, monkeypatch):
+    instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+    )
+    calls = []
+
+    async def execute(*_args, **_kwargs):
+        calls.append(True)
+        return stream_error(
+            "RuntimeReplacedError",
+            "runtime_replaced: expected incarnation a, observed f",
+        )
+
+    instance.execute = execute
+    with pytest.raises(RuntimeReplacedError):
+        asyncio.run(instance.filesystem_list("/content", "runtime"))
+    with pytest.raises(RuntimeReplacedError) as second:
+        asyncio.run(instance.filesystem_stat("/content/file", "runtime"))
+
+    assert len(calls) == 1
+    assert second.value.details["probable_cause"] == "colab_runtime_recycle_or_runtime_oom"
+
+
+def test_unknown_remote_process_returns_journaled_metadata_and_diagnostic(tmp_path, monkeypatch):
+    instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+    )
+    instance.process_journal.update(
+        "runtime",
+        {"process_id": "process-1", "argv": ["worker"], "status": "running", "pid": 9},
+    )
+
+    async def execute(*_args, **_kwargs):
+        return stream_error("FileNotFoundError", "Unknown process_id: process-1")
+
+    instance.execute = execute
+    result = asyncio.run(instance.process_status("process-1", "runtime"))
+
+    assert result["status"] == "lost"
+    assert result["last_known_process"]["pid"] == 9
+    assert result["diagnostic"]["code"] == "process_state_lost"
+    assert result["diagnostic"]["probable_cause"] == "remote_process_state_lost_or_runtime_oom"

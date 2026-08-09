@@ -14,6 +14,8 @@ runtimes are ephemeral execution environments.
   stored in process metadata. Session-token fields are excluded from public responses.
 - On POSIX hosts, the local state directory is mode 0700 and token-bearing session/checkpoint files
   are mode 0600. On Windows, they inherit the current user's profile ACL.
+- Last-known process metadata is stored in the same protected local state directory; environment
+  values remain excluded, while argv is retained because managed process arguments are inspectable.
 - Detached-process environment values are consumed through a mode-0600 launch file that is removed
   before process creation returns; they are not placed in the runner command line. Put secrets in
   environment overrides, never in `argv`, because process arguments are intentionally inspectable.

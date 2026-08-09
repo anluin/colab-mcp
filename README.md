@@ -141,6 +141,10 @@ Every process, filesystem, transfer, and introspection call verifies it before a
 state. If Colab recycles an endpoint onto a fresh backend, the call fails explicitly with
 `runtime_replaced` instead of reporting `Unknown process_id` or an apparently empty filesystem;
 stop the stale session record and start a new runtime.
+Managed-process metadata is also journaled locally. If its remote record vanishes, process tools
+return `status="lost"`, the last known argv/cwd/PID/status, and a probable-cause diagnostic such as
+runtime recycling or OOM. After the first fingerprint mismatch, later file and process calls fail
+locally without reconnecting to the replacement backend.
 Every command is runtime-owned and receives a `process_id`. The timeout is only how long the MCP
 call waits: if it expires, `process_continues=true` and the command remains alive for later
 status/output/signal calls. Termination is always explicit. Python/Jupyter output is bounded to
