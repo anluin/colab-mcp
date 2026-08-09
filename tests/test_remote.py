@@ -8,13 +8,14 @@ from pathlib import Path
 import pytest
 from colab_cli.state import SessionState
 
-from src.manager import ColabManager
+from src.manager import ColabManager, ManagedSessionState
 from src.remote import (
     MAX_OUTPUT_LIMIT,
     MAX_PROCESS_OUTPUT_LIMIT,
     PROCESS_RUNNER_SOURCE,
     RESULT_PREFIX,
     RemoteOperationError,
+    RuntimeReplacedError,
     build_remote_code,
     parse_remote_result,
     validate_argv,
@@ -69,6 +70,7 @@ def test_process_output_reads_flattened_exit_byte_count():
 @pytest.mark.parametrize(
     "operation",
     [
+        "incarnation_init",
         "process_start",
         "process_status",
         "process_list",
@@ -97,6 +99,34 @@ def test_parse_remote_result_and_error():
         parse_remote_result([{"output_type": "stream", "text": RESULT_PREFIX + failure}])
     with pytest.raises(RemoteOperationError, match="no structured result"):
         parse_remote_result([])
+
+
+def test_parse_runtime_replaced_error_has_stable_type_and_code():
+    failure = json.dumps(
+        {
+            "ok": False,
+            "error": {
+                "type": "RuntimeReplacedError",
+                "message": "runtime_replaced: expected old, observed missing",
+            },
+        }
+    )
+    with pytest.raises(RuntimeReplacedError, match="runtime_replaced") as caught:
+        parse_remote_result([{"output_type": "stream", "text": RESULT_PREFIX + failure}])
+    assert caught.value.code == "runtime_replaced"
+
+
+def test_remote_operations_verify_incarnation_before_process_or_filesystem_state():
+    code = build_remote_code(
+        "process_status",
+        {
+            "process_id": "old-process",
+            "runtime_fingerprint": "a" * 32,
+        },
+    )
+    assert code.index("_cm_actual_fingerprint != _cm_expected_fingerprint") < code.index(
+        "_cm_metadata(_cm_payload['process_id'])"
+    )
 
 
 @pytest.mark.parametrize("argv", [[], [""], [1]])
@@ -350,12 +380,13 @@ def test_runtime_inspection_is_bounded_and_forwarded(tmp_path, monkeypatch):
 def test_read_only_remote_operation_reconnects_kernel_once(tmp_path, monkeypatch):
     instance = make_manager(tmp_path, monkeypatch)
     instance.store.add(
-        SessionState(
+        ManagedSessionState(
             name="runtime",
             token="secret",
             url="https://runtime",
             endpoint="endpoint",
             kernel_id="stale-kernel",
+            runtime_fingerprint="a" * 32,
         )
     )
     calls = []
@@ -377,6 +408,15 @@ def test_read_only_remote_operation_reconnects_kernel_once(tmp_path, monkeypatch
 
 def test_mutating_remote_operation_is_never_retried(tmp_path, monkeypatch):
     instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+    )
     calls = []
 
     async def execute(*_args, **_kwargs):
@@ -385,5 +425,45 @@ def test_mutating_remote_operation_is_never_retried(tmp_path, monkeypatch):
 
     instance.execute = execute
     with pytest.raises(TimeoutError, match="unknown write outcome"):
-        asyncio.run(instance._remote_operation("fs_write", {}, None))
+        asyncio.run(instance._remote_operation("fs_write", {}, "runtime"))
     assert len(calls) == 1
+
+
+def test_remote_operation_rejects_legacy_session_before_execution(tmp_path, monkeypatch):
+    instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        SessionState(name="legacy", token="secret", url="https://runtime", endpoint="endpoint")
+    )
+
+    async def execute(*_args, **_kwargs):
+        raise AssertionError("unverified runtime must not execute an operation")
+
+    instance.execute = execute
+    with pytest.raises(RuntimeReplacedError, match="stop it and start a new session"):
+        asyncio.run(instance._remote_operation("fs_list", {"path": "/content"}, "legacy"))
+
+
+def test_remote_operation_injects_persisted_fingerprint(tmp_path, monkeypatch):
+    instance = make_manager(tmp_path, monkeypatch)
+    instance.store.add(
+        ManagedSessionState(
+            name="runtime",
+            token="secret",
+            url="https://runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="b" * 32,
+        )
+    )
+    captured = {}
+
+    def build(operation, payload):
+        captured.update(operation=operation, payload=payload)
+        return "remote code"
+
+    async def execute(*_args, **_kwargs):
+        return stream_result({"entries": []})
+
+    monkeypatch.setattr("src.manager.build_remote_code", build)
+    instance.execute = execute
+    asyncio.run(instance._remote_operation("fs_list", {"path": "/content"}, "runtime"))
+    assert captured["payload"]["runtime_fingerprint"] == "b" * 32

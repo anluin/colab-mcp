@@ -111,6 +111,12 @@ class RemoteOperationError(RuntimeError):
     """A structured operation failed inside the remote runtime."""
 
 
+class RuntimeReplacedError(RemoteOperationError):
+    """The Colab endpoint now refers to a different ephemeral backend."""
+
+    code = "runtime_replaced"
+
+
 def validate_argv(argv: list[str]) -> None:
     if not argv or any(not isinstance(value, str) or not value for value in argv):
         raise ValueError("argv must contain at least one non-empty string")
@@ -166,8 +172,9 @@ import uuid as _cm_uuid
 
 _cm_payload = _cm_json.loads(_cm_base64.b64decode({encoded!r}).decode())
 _cm_root = _cm_pathlib.Path('/content').resolve()
-_cm_process_root = _cm_root / '.colab-mcp' / 'processes'
-_cm_process_root.mkdir(parents=True, exist_ok=True)
+_cm_state_root = _cm_root / '.colab-mcp'
+_cm_incarnation_path = _cm_state_root / 'runtime-incarnation'
+_cm_process_root = _cm_state_root / 'processes'
 
 def _cm_path(value):
     candidate = (_cm_root / (value or '.')).resolve() if not _cm_pathlib.Path(value or '.').is_absolute() else _cm_pathlib.Path(value).resolve()
@@ -205,9 +212,36 @@ def _cm_stat(path):
             value.st_mtime, _cm_datetime.timezone.utc).isoformat(),
     }}
 
+class RuntimeReplacedError(RuntimeError):
+    pass
+
 try:
     _cm_operation = {operation!r}
-    if _cm_operation == 'process_start':
+    if _cm_operation == 'incarnation_init':
+        _cm_fingerprint = _cm_payload.get('runtime_fingerprint')
+        if not isinstance(_cm_fingerprint, str) or len(_cm_fingerprint) != 32 or not all(
+                char in '0123456789abcdef' for char in _cm_fingerprint):
+            raise ValueError('runtime_fingerprint must be 32 lowercase hexadecimal characters')
+        _cm_state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _cm_temporary_incarnation = _cm_incarnation_path.with_suffix('.tmp')
+        _cm_temporary_incarnation.write_text(_cm_fingerprint, encoding='ascii')
+        _cm_temporary_incarnation.replace(_cm_incarnation_path)
+        _cm_result = {{'runtime_fingerprint': _cm_fingerprint}}
+    else:
+        _cm_expected_fingerprint = _cm_payload.get('runtime_fingerprint')
+        _cm_actual_fingerprint = (
+            _cm_incarnation_path.read_text(encoding='ascii').strip()
+            if _cm_incarnation_path.is_file() else None)
+        if _cm_actual_fingerprint != _cm_expected_fingerprint:
+            _cm_actual_label = _cm_actual_fingerprint or 'missing'
+            raise RuntimeReplacedError(
+                'runtime_replaced: expected incarnation ' + str(_cm_expected_fingerprint)
+                + ', observed ' + _cm_actual_label
+                + '; Colab recycled the backend, so start a new session')
+        _cm_process_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if _cm_operation == 'incarnation_init':
+        pass
+    elif _cm_operation == 'process_start':
         _cm_cwd = _cm_path(_cm_payload.get('cwd'))
         if not _cm_cwd.is_dir():
             raise NotADirectoryError(str(_cm_cwd))
@@ -468,7 +502,9 @@ def parse_remote_result(outputs: list[dict[str, Any]]) -> Any:
             if payload.get("ok"):
                 return payload.get("result")
             error = payload.get("error") or {}
-            raise RemoteOperationError(
-                f"{error.get('type', 'RemoteError')}: {error.get('message', 'operation failed')}"
-            )
+            error_type = error.get("type", "RemoteError")
+            message = error.get("message", "operation failed")
+            if error_type == "RuntimeReplacedError" or str(message).startswith("runtime_replaced:"):
+                raise RuntimeReplacedError(message)
+            raise RemoteOperationError(f"{error_type}: {message}")
     raise RemoteOperationError("Remote runtime returned no structured result")

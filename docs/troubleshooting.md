@@ -27,6 +27,11 @@ orphan endpoints are live assignments not owned by this state directory. Use cle
 after checking that an orphan is not a browser or another client session. Cleanup errors are safe
 to retry.
 
+If an operation reports `runtime_replaced`, Colab has recycled the endpoint onto a different
+ephemeral backend (or the session predates incarnation tracking). Do not retry old process IDs or
+interpret an empty `/content` as the old runtime. Stop the stale session, start a new one, and
+restore files from durable local storage.
+
 ## Commands time out or the kernel disappears
 
 Prefer `colab_process_start` for long work. Poll status and output, and signal it when needed. A

@@ -20,6 +20,11 @@ inside its assigned runtime. Releasing the assignment is the lifecycle boundary:
 processes, and runtime metadata are ephemeral. Notebook execution is an adapter over Python/kernel
 execution, not a separate compute model.
 
+Allocation also persists a random incarnation fingerprint in local session state and in a marker
+under the assigned backend's `/content`. The common remote-operation envelope validates the marker
+before process, filesystem, transfer, or introspection code runs. A missing or different marker is
+reported as `runtime_replaced`; it is never interpreted as an empty filesystem or missing process.
+
 The server does not expose a network listener. MCP request boundaries do not bound remote process
 lifetime; detached process state and output are polled in later requests. A runner continuously
 drains both output pipes, retains each stream only up to its configured cap, and records truncation

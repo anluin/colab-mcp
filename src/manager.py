@@ -27,6 +27,7 @@ from .remote import (
     DEFAULT_PROCESS_OUTPUT_LIMIT,
     MAX_OUTPUT_LIMIT,
     RemoteOperationError,
+    RuntimeReplacedError,
     build_remote_code,
     parse_remote_result,
     validate_argv,
@@ -45,6 +46,12 @@ class KernelConnectionError(RuntimeError):
     """The runtime operation was not sent because kernel connection setup failed."""
 
 
+class ManagedSessionState(SessionState):
+    """Persisted assignment ownership plus this backend incarnation's marker."""
+
+    runtime_fingerprint: str | None = None
+
+
 def _secure_permissions(path: Path, mode: int, platform: str = os.name) -> None:
     """Apply owner-only POSIX permissions; Windows relies on the user profile ACL."""
     if platform != "nt" and path.exists():
@@ -53,6 +60,17 @@ def _secure_permissions(path: Path, mode: int, platform: str = os.name) -> None:
 
 class SecureStateStore(StateStore):
     """Upstream state storage with explicit protection for runtime proxy tokens."""
+
+    def _load_raw(self, handle: Any) -> dict[str, SessionState]:
+        try:
+            handle.seek(0)
+            content = handle.read()
+            if not content or content.isspace():
+                return {}
+            data = json.loads(content)
+            return {key: ManagedSessionState(**value) for key, value in data.items()}
+        except Exception:
+            return {}
 
     def add(self, state: SessionState) -> None:
         super().add(state)
@@ -271,19 +289,21 @@ class ColabManager:
         accelerator = Accelerator(gpu) if gpu else Accelerator.NONE
         response = await asyncio.to_thread(self.client().assign, uuid.uuid4(), variant, accelerator)
         proxy = response.runtime_proxy_info
-        session = SessionState(
+        session = ManagedSessionState(
             name=name,
             token=proxy.token,
             url=proxy.url,
             endpoint=response.endpoint,
             variant=variant.value,
             accelerator=accelerator.value,
+            runtime_fingerprint=uuid.uuid4().hex,
         )
         # Persist immediately after assignment. If either preflight or cleanup
         # fails, a later reconciliation still knows which endpoint we own.
         self.store.add(session)
         try:
             await asyncio.to_thread(self.client().keep_alive_assignment, session.endpoint)
+            await self._initialize_runtime_incarnation(session)
         except Exception as preflight_error:
             try:
                 await asyncio.to_thread(self.client().unassign, session.endpoint)
@@ -300,6 +320,16 @@ class ColabManager:
         self.ensure_keepalive(session)
         logger.info("runtime_allocated session=%s accelerator=%s", name, accelerator.value)
         return session
+
+    async def _initialize_runtime_incarnation(self, session: ManagedSessionState) -> None:
+        """Write the marker before exposing a newly allocated runtime to tools."""
+        code = build_remote_code(
+            "incarnation_init", {"runtime_fingerprint": session.runtime_fingerprint}
+        )
+        outputs = await self.execute(code, session.name, 120, output_limit=3_000_000)
+        result = parse_remote_result(outputs)
+        if result.get("runtime_fingerprint") != session.runtime_fingerprint:
+            raise RuntimeError("Runtime incarnation initialization returned an invalid marker")
 
     def create_notebook(self, path: str, cells: list[str] | None = None) -> dict[str, Any]:
         """Create a local Colab-ready notebook without allocating compute."""
@@ -450,6 +480,14 @@ class ColabManager:
     async def _remote_operation(
         self, operation: str, payload: dict[str, Any], name: str | None, timeout: float = 120
     ) -> Any:
+        session = self.resolve(name)
+        fingerprint = getattr(session, "runtime_fingerprint", None)
+        if not fingerprint:
+            raise RuntimeReplacedError(
+                f"runtime_replaced: session {session.name!r} has no verifiable runtime "
+                "incarnation; stop it and start a new session"
+            )
+        payload = {**payload, "runtime_fingerprint": fingerprint}
         code = build_remote_code(operation, payload)
         try:
             outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
@@ -465,7 +503,6 @@ class ColabManager:
             }
             if operation not in retryable:
                 raise
-            session = self.resolve(name)
             session.kernel_id = None
             self.store.add(session)
             logger.warning("kernel_reconnect_retry operation=%s session=%s", operation, name)

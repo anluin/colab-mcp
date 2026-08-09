@@ -136,6 +136,11 @@ No shell parses `argv`. Remote working directories must remain under `/content`.
 stderr result is limited to 100 KB by default (1 MB maximum). For longer work, use
 `colab_process_start`, then poll status and consume output using the returned `next_offset`.
 Process records belong to one runtime and disappear when that ephemeral runtime is released.
+Each session records a random runtime-incarnation fingerprint both locally and under `/content`.
+Every process, filesystem, transfer, and introspection call verifies it before accessing remote
+state. If Colab recycles an endpoint onto a fresh backend, the call fails explicitly with
+`runtime_replaced` instead of reporting `Unknown process_id` or an apparently empty filesystem;
+stop the stale session record and start a new runtime.
 Every command is runtime-owned and receives a `process_id`. The timeout is only how long the MCP
 call waits: if it expires, `process_continues=true` and the command remains alive for later
 status/output/signal calls. Termination is always explicit. Python/Jupyter output is bounded to

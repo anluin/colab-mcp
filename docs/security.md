@@ -23,6 +23,8 @@ runtimes are ephemeral execution environments.
 - Runtime paths resolve under `/content`; `/content` itself cannot be recursively removed.
 - Overwrite, append, recursive deletion, stale-record removal, and orphan release are explicit.
 - New endpoint ownership is persisted before preflight so cleanup failures remain discoverable.
+- Random runtime-incarnation markers prevent operations from crossing into a recycled Colab
+  backend that happens to reuse an endpoint or kernel connection.
 - The server listens on no TCP port and performs no interactive authentication.
 
 ## Residual risks

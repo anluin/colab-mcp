@@ -7,7 +7,6 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from colab_cli.state import SessionState
 
 from src.cli import (
     _client_has_server,
@@ -20,6 +19,7 @@ from src.cli import (
 )
 from src.manager import (
     ColabManager,
+    ManagedSessionState,
     _bound_outputs,
     _json_safe,
     _secure_permissions,
@@ -246,8 +246,24 @@ def test_server_credentials_never_prompt(tmp_path: Path, monkeypatch: pytest.Mon
         instance.client()
 
 
-def session(name: str, endpoint: str) -> SessionState:
-    return SessionState(name=name, token="secret", url="https://runtime", endpoint=endpoint)
+def session(name: str, endpoint: str) -> ManagedSessionState:
+    return ManagedSessionState(
+        name=name,
+        token="secret",
+        url="https://runtime",
+        endpoint=endpoint,
+        runtime_fingerprint="a" * 32,
+    )
+
+
+def test_runtime_fingerprint_survives_state_store_restart(tmp_path, monkeypatch):
+    first = manager(tmp_path, monkeypatch)
+    first.store.add(session("runtime", "endpoint"))
+
+    recovered = manager(tmp_path, monkeypatch).store.get("runtime")
+
+    assert isinstance(recovered, ManagedSessionState)
+    assert recovered.runtime_fingerprint == "a" * 32
 
 
 def test_reconcile_reports_and_explicitly_cleans_stale_and_orphaned_assignments(
@@ -360,6 +376,58 @@ def test_start_releases_and_forgets_failed_preflight_when_cleanup_succeeds(
         asyncio.run(instance.start("failed", None))
     assert client.released == ["allocated"]
     assert instance.store.get("failed") is None
+
+
+def test_start_initializes_and_persists_runtime_incarnation(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    initialized = []
+
+    class FakeClient:
+        def assign(self, *_args):
+            proxy = SimpleNamespace(token="secret", url="https://runtime")
+            return SimpleNamespace(endpoint="allocated", runtime_proxy_info=proxy)
+
+        def keep_alive_assignment(self, endpoint):
+            return None
+
+    async def initialize(runtime):
+        initialized.append(runtime.runtime_fingerprint)
+
+    instance.client = lambda: FakeClient()
+    instance._initialize_runtime_incarnation = initialize
+    created = asyncio.run(instance.start("runtime", None))
+
+    assert len(initialized) == 1
+    assert initialized[0] == created.runtime_fingerprint
+    assert len(created.runtime_fingerprint) == 32
+    assert instance.store.get("runtime").runtime_fingerprint == created.runtime_fingerprint
+
+
+def test_start_releases_runtime_when_incarnation_initialization_fails(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    released = []
+
+    class FakeClient:
+        def assign(self, *_args):
+            proxy = SimpleNamespace(token="secret", url="https://runtime")
+            return SimpleNamespace(endpoint="allocated", runtime_proxy_info=proxy)
+
+        def keep_alive_assignment(self, endpoint):
+            return None
+
+        def unassign(self, endpoint):
+            released.append(endpoint)
+
+    async def initialize(_runtime):
+        raise OSError("kernel unavailable")
+
+    instance.client = lambda: FakeClient()
+    instance._initialize_runtime_incarnation = initialize
+    with pytest.raises(RuntimeError, match="failed preflight and was released"):
+        asyncio.run(instance.start("runtime", None))
+
+    assert released == ["allocated"]
+    assert instance.store.get("runtime") is None
 
 
 def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
