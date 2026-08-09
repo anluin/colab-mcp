@@ -41,7 +41,11 @@ def drain(stream, path, truncated_path):
     truncated = False
     with path.open("wb", buffering=0) as handle:
         while True:
-            chunk = stream.read(65_536)
+            # BufferedReader.read(size) tries to fill the requested size and can
+            # retain flushed, short writes until 64 KiB or EOF.  Read the pipe
+            # directly so each available write reaches the durable spool while
+            # the child is still running.
+            chunk = os.read(stream.fileno(), 65_536)
             if not chunk:
                 break
             remaining = max(0, output_limit - min(total, output_limit))
@@ -315,6 +319,13 @@ try:
         else:
             _cm_data, _cm_next, _cm_more = b'', _cm_offset, False
         _cm_status_value = _cm_status(_cm_directory, _cm_metadata_value)
+        _cm_stored_bytes = _cm_path_value.stat().st_size if _cm_path_value.exists() else 0
+        _cm_total_bytes = _cm_status_value.get(_cm_stream + '_total_bytes')
+        if _cm_total_bytes is None:
+            # The final byte count is written to exit.json.  Until then the
+            # persisted spool size is the strongest observable lower bound and
+            # must not be reported as null.
+            _cm_total_bytes = _cm_stored_bytes
         _cm_result = {{
             'process_id': _cm_payload['process_id'], 'stream': _cm_stream,
             'offset': _cm_offset, 'next_offset': _cm_next,
@@ -323,7 +334,10 @@ try:
             'eof': _cm_status_value['status'] != 'running' and not _cm_more,
             'status': _cm_status_value['status'],
             'truncated': (_cm_directory / (_cm_stream + '.truncated')).exists(),
-            'total_bytes': _cm_status_value.get(_cm_stream + '_total_bytes'),
+            'stored_bytes': _cm_stored_bytes,
+            'total_bytes': _cm_total_bytes,
+            'total_bytes_final': _cm_status_value['status'] != 'running',
+            'output_limit': _cm_metadata_value.get('output_limit'),
         }}
     elif _cm_operation == 'process_signal':
         _cm_directory, _cm_metadata_value = _cm_metadata(_cm_payload['process_id'])

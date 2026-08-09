@@ -785,6 +785,8 @@ class ColabManager:
                 "process_id": process_id,
                 "status": result["status"],
                 f"{stream}_next_offset": result["next_offset"],
+                f"{stream}_stored_bytes": result["stored_bytes"],
+                f"{stream}_total_bytes": result["total_bytes"],
             },
         )
         return result

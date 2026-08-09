@@ -3,6 +3,7 @@ import base64
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -65,11 +66,15 @@ def test_process_environment_is_not_passed_in_runner_command_line():
     assert "_cm_runner_payload]" not in code
 
 
-def test_process_output_reads_flattened_exit_byte_count():
+def test_process_output_reconciles_exit_count_with_live_spool_size():
     code = build_remote_code(
         "process_output", {"process_id": "process", "stream": "stdout", "limit": 100}
     )
     assert "_cm_status_value.get(_cm_stream + '_total_bytes')" in code
+    assert "_cm_path_value.stat().st_size" in code
+    assert "'stored_bytes': _cm_stored_bytes" in code
+    assert "_cm_total_bytes = _cm_stored_bytes" in code
+    assert "'total_bytes_final': _cm_status_value['status'] != 'running'" in code
 
 
 @pytest.mark.parametrize(
@@ -198,6 +203,41 @@ def test_process_runner_caps_both_streams_and_reports_truncation(tmp_path):
     assert result["stderr_truncated"] is True
 
 
+def test_process_runner_spools_flushed_short_writes_before_exit(tmp_path):
+    process_directory = tmp_path / "live-process"
+    process_directory.mkdir()
+    runner = process_directory / "runner.py"
+    runner.write_text(PROCESS_RUNNER_SOURCE, encoding="utf-8")
+    launch = process_directory / "launch.json"
+    launch.write_text(
+        json.dumps(
+            {
+                "argv": [
+                    sys.executable,
+                    "-c",
+                    "import time; print('{\"step\": 180}', flush=True); time.sleep(2)",
+                ],
+                "cwd": str(tmp_path),
+                "environment": {},
+                "directory": str(process_directory),
+                "output_limit": 1024,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    running = subprocess.Popen([sys.executable, str(runner), str(launch)])
+    spool = process_directory / "stdout.log"
+    try:
+        expires = time.monotonic() + 1.5
+        while (not spool.exists() or spool.stat().st_size == 0) and time.monotonic() < expires:
+            time.sleep(0.02)
+        assert running.poll() is None
+        assert spool.read_text(encoding="utf-8") == '{"step": 180}\n'
+    finally:
+        running.wait(timeout=5)
+
+
 @pytest.mark.parametrize("value", [0, 21_601])
 def test_invalid_timeout_is_rejected(value):
     with pytest.raises(ValueError, match="timeout"):
@@ -305,6 +345,8 @@ def test_process_operations_cross_request_boundaries(tmp_path, monkeypatch):
                 "process_id": payload["process_id"],
                 "status": "running",
                 "next_offset": payload["offset"],
+                "stored_bytes": 180,
+                "total_bytes": 180,
             }
         return {
             "operation": operation,
@@ -326,6 +368,9 @@ def test_process_operations_cross_request_boundaries(tmp_path, monkeypatch):
     ]
     assert operations[0][1]["process_id"]
     assert operations[0][1]["output_limit"] == 10_000_000
+    journaled = instance.process_journal.get("runtime", "abc")
+    assert journaled["stdout_stored_bytes"] == 180
+    assert journaled["stdout_total_bytes"] == 180
 
 
 def test_process_arguments_fail_before_remote_call(tmp_path, monkeypatch):

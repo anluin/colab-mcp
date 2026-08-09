@@ -37,6 +37,14 @@ not. Inspect `last_known_process` and `diagnostic.probable_cause`; common causes
 recycling, runtime OOM/reset, or deleted remote process state. This is diagnostic evidence, not a
 guaranteed root-cause determination.
 
+## Running process has empty output
+
+Current process runners persist each available stdout/stderr pipe write immediately. A process
+started by an older server may still use the previous buffered relay and expose no spool data until
+64 KiB or process exit, even when the child flushes. Updating the local server cannot replace an
+already-running remote runner; let that process finish or explicitly terminate and restart it after
+updating. Checkpoint files written directly by the child remain independent of the output spool.
+
 ## Commands time out or the kernel disappears
 
 Prefer `colab_process_start` for long work. Poll status and output, and signal it when needed. A

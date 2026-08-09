@@ -151,7 +151,10 @@ status/output/signal calls. Termination is always explicit. Python/Jupyter outpu
 100 KB by default (1 MB maximum) and ends with an explicit truncation marker.
 Detached processes retain at most 10 MB per output stream by default (configurable up to 1 GB with
 `output_limit`). They continue draining excess output so the child cannot deadlock; output reads
-return `truncated=true` and, after exit, `total_bytes` when retained output was capped.
+return `truncated=true` when retained output was capped. While a process is running,
+`stored_bytes` and `total_bytes` reflect the durable spool currently available to readers;
+`total_bytes_final=false` marks that live lower bound. After exit, `total_bytes` is the
+complete byte count, including discarded bytes, and `total_bytes_final=true`.
 The handoff deadline is best-effort because each Colab kernel status/output round-trip has latency;
 it is not a hard real-time deadline.
 
