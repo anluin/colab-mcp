@@ -110,7 +110,7 @@ uv --directory /absolute/path/to/colab-mcp run --locked colab-mcp serve
 - Keep active runtimes alive while the MCP server runs.
 - Release runtimes explicitly after experiments or errors.
 
-Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`,
+Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`, `colab_keepalive`,
 `colab_run_command`, `colab_process_start`, `colab_process_status`, `colab_process_list`,
 `colab_process_output`, `colab_process_signal`, `colab_process_export`, `colab_execute`,
 `colab_execute_notebook`, `colab_allocation_probe`,
@@ -121,6 +121,20 @@ Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`,
 `colab_paused_notebooks`, `colab_reconcile`, `colab_stop`, and `colab_compute_units`.
 Use `colab_inspect` after allocation to discover the actual runtime rather than assuming that a
 requested accelerator, executable, or CUDA version is present.
+
+### Idle keep-alive
+
+Each tracked assignment gets the upstream CLI's authenticated Tunnel Frontend keep-alive every 60
+seconds. The task continues across transient errors, persists its last success/error and consecutive
+failure count, and is restored from session state when the MCP server restarts. Use
+`colab_keepalive(refresh=true)` to send an immediate ping and inspect heartbeat health before an
+agent begins a long reasoning-only interval.
+
+This refreshes Colab's idle timer; it does not execute synthetic workloads, bypass policy, extend a
+maximum VM lifetime, reserve an accelerator, or guarantee persistence. Google states that personal
+Colab idle timeouts and maximum lifetimes vary and runtimes may still be terminated. See the
+[official Colab FAQ](https://research.google.com/colaboratory/faq.html) and the upstream
+[CLI session-management design](https://github.com/googlecolab/google-colab-cli/blob/main/docs/01_session_management.md#5-keep-alive-protocol).
 
 ### General command example
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
@@ -7,6 +8,18 @@ from mcp.server.fastmcp import FastMCP
 from .logging_config import configure_logging
 from .manager import COMPUTE_UNITS_URL, ColabManager
 from .version import COLAB_CLI_VERSION, COLAB_MCP_VERSION
+
+manager = ColabManager()
+
+
+@asynccontextmanager
+async def server_lifespan(_server: FastMCP):
+    await manager.recover_keepalives()
+    try:
+        yield
+    finally:
+        await manager.shutdown_keepalives()
+
 
 mcp = FastMCP(
     "Google Colab Runtime",
@@ -16,8 +29,8 @@ mcp = FastMCP(
         "sessions after use to release quota. Pause releases the runtime; resume "
         "creates a fresh runtime and does not preserve RAM or /content files."
     ),
+    lifespan=server_lifespan,
 )
-manager = ColabManager()
 
 
 @mcp.tool()
@@ -39,6 +52,12 @@ async def colab_health() -> dict:
 async def colab_sessions() -> list[dict]:
     """List locally tracked sessions and whether they still exist on Colab."""
     return await manager.sessions()
+
+
+@mcp.tool()
+async def colab_keepalive(session: str | None = None, refresh: bool = True) -> dict:
+    """Report heartbeat health and optionally refresh the Colab idle timer immediately."""
+    return await manager.keepalive(session, refresh)
 
 
 @mcp.tool()

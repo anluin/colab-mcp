@@ -54,6 +54,10 @@ class ManagedSessionState(SessionState):
     runtime_fingerprint: str | None = None
     runtime_replaced_at: str | None = None
     runtime_replaced_reason: str | None = None
+    keepalive_status: str | None = None
+    last_keepalive_at: str | None = None
+    last_keepalive_error: str | None = None
+    consecutive_keepalive_failures: int = 0
 
 
 def _secure_permissions(path: Path, mode: int, platform: str = os.name) -> None:
@@ -317,19 +321,80 @@ class ColabManager:
             raise ValueError(f"Unknown session: {name}")
         return session
 
-    async def _keepalive_loop(self, name: str, endpoint: str) -> None:
+    def _persist_keepalive(
+        self,
+        name: str,
+        endpoint: str,
+        *,
+        status: str,
+        error: str | None,
+        succeeded: bool,
+    ) -> ManagedSessionState | None:
+        current = self.store.get(name)
+        if current is None or current.endpoint != endpoint:
+            return None
+        current.keepalive_status = status
+        current.last_keepalive_error = error
+        if succeeded:
+            current.last_keepalive_at = datetime.datetime.now(datetime.UTC).isoformat()
+            current.consecutive_keepalive_failures = 0
+        else:
+            current.consecutive_keepalive_failures += 1
+        self.store.add(current)
+        return current
+
+    async def _keepalive_once(self, session: SessionState) -> bool:
         try:
-            while True:
-                await asyncio.sleep(self.keepalive_seconds)
-                current = self.store.get(name)
-                if current is None or current.endpoint != endpoint:
-                    return
-                await asyncio.to_thread(self.client().keep_alive_assignment, endpoint)
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            # A later status/execute call will surface a stale assignment clearly.
-            return
+            await asyncio.to_thread(self.client().keep_alive_assignment, session.endpoint)
+        except Exception as error:
+            current = self._persist_keepalive(
+                session.name,
+                session.endpoint,
+                status="degraded",
+                error=str(error)[:1_000],
+                succeeded=False,
+            )
+            logger.warning(
+                "keepalive_error session=%s failures=%d error_type=%s",
+                session.name,
+                current.consecutive_keepalive_failures if current else 0,
+                type(error).__name__,
+            )
+            return False
+        self._persist_keepalive(
+            session.name,
+            session.endpoint,
+            status="healthy",
+            error=None,
+            succeeded=True,
+        )
+        return True
+
+    async def _keepalive_loop(self, name: str, endpoint: str) -> None:
+        while True:
+            current = self.store.get(name)
+            if current is None or current.endpoint != endpoint:
+                return
+            succeeded = await self._keepalive_once(current)
+            current = self.store.get(name)
+            if current is None or current.endpoint != endpoint:
+                return
+            if not succeeded and current.consecutive_keepalive_failures >= 2:
+                try:
+                    assignments = await asyncio.to_thread(self.client().list_assignments)
+                except Exception:
+                    pass
+                else:
+                    if endpoint not in {item.endpoint for item in assignments}:
+                        self._persist_keepalive(
+                            name,
+                            endpoint,
+                            status="lease_lost",
+                            error="tracked assignment is no longer active",
+                            succeeded=False,
+                        )
+                        return
+            await asyncio.sleep(self.keepalive_seconds)
 
     def ensure_keepalive(self, session: SessionState) -> None:
         task = self._keepalives.get(session.name)
@@ -337,6 +402,65 @@ class ColabManager:
             self._keepalives[session.name] = asyncio.create_task(
                 self._keepalive_loop(session.name, session.endpoint)
             )
+
+    async def recover_keepalives(self) -> dict[str, Any]:
+        """Restore heartbeats for persisted assignments when the MCP server restarts."""
+        local = self.store.list()
+        if not local:
+            return {"recovered": [], "lease_lost": [], "error": None}
+        try:
+            assignments = await asyncio.to_thread(self.client().list_assignments)
+        except Exception as error:
+            logger.warning("keepalive_recovery_error error_type=%s", type(error).__name__)
+            return {"recovered": [], "lease_lost": [], "error": str(error)[:1_000]}
+        endpoints = {item.endpoint for item in assignments}
+        recovered: list[str] = []
+        lease_lost: list[str] = []
+        for session in local.values():
+            if session.endpoint in endpoints:
+                self.ensure_keepalive(session)
+                recovered.append(session.name)
+            else:
+                self._persist_keepalive(
+                    session.name,
+                    session.endpoint,
+                    status="lease_lost",
+                    error="tracked assignment was absent during server startup recovery",
+                    succeeded=False,
+                )
+                lease_lost.append(session.name)
+        logger.info("keepalive_recovered active=%d lease_lost=%d", len(recovered), len(lease_lost))
+        return {"recovered": recovered, "lease_lost": lease_lost, "error": None}
+
+    async def shutdown_keepalives(self) -> None:
+        """Stop only local heartbeat tasks; runtime ownership remains persisted."""
+        tasks = list(self._keepalives.values())
+        self._keepalives.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def keepalive(self, name: str | None, refresh: bool = True) -> dict[str, Any]:
+        """Report heartbeat health and optionally send an immediate upstream ping."""
+        session = self.resolve(name)
+        refreshed = None
+        if refresh:
+            refreshed = await self._keepalive_once(session)
+        current = self.resolve(session.name)
+        self.ensure_keepalive(current)
+        task = self._keepalives.get(current.name)
+        return {
+            "session": current.name,
+            "status": getattr(current, "keepalive_status", None) or "scheduled",
+            "refresh_succeeded": refreshed,
+            "last_keepalive_at": getattr(current, "last_keepalive_at", None),
+            "last_error": getattr(current, "last_keepalive_error", None),
+            "consecutive_failures": getattr(current, "consecutive_keepalive_failures", 0),
+            "interval_seconds": self.keepalive_seconds,
+            "background_task_running": task is not None and not task.done(),
+            "guarantees_runtime_persistence": False,
+        }
 
     async def start(self, name: str, gpu: str | None) -> SessionState:
         if self.store.get(name):
@@ -360,7 +484,8 @@ class ColabManager:
         # fails, a later reconciliation still knows which endpoint we own.
         self.store.add(session)
         try:
-            await asyncio.to_thread(self.client().keep_alive_assignment, session.endpoint)
+            if not await self._keepalive_once(session):
+                raise RuntimeError("initial Colab assignment keep-alive failed")
             await self._initialize_runtime_incarnation(session)
         except Exception as preflight_error:
             try:

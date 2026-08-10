@@ -436,6 +436,89 @@ def test_start_releases_runtime_when_incarnation_initialization_fails(tmp_path, 
     assert instance.store.get("runtime") is None
 
 
+def test_keepalive_retries_after_transient_error_and_persists_health(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    instance.keepalive_seconds = 0.01
+    attempts = []
+
+    class FakeClient:
+        def keep_alive_assignment(self, endpoint):
+            attempts.append(endpoint)
+            if len(attempts) == 1:
+                raise OSError("temporary network failure")
+
+        def list_assignments(self):
+            return [SimpleNamespace(endpoint="endpoint")]
+
+    async def scenario():
+        instance.client = lambda: FakeClient()
+        instance.ensure_keepalive(instance.resolve("runtime"))
+        deadline = asyncio.get_running_loop().time() + 1
+        while len(attempts) < 2 and asyncio.get_running_loop().time() < deadline:
+            await asyncio.sleep(0.01)
+        await instance.shutdown_keepalives()
+
+    asyncio.run(scenario())
+    current = instance.store.get("runtime")
+    assert len(attempts) >= 2
+    assert current.keepalive_status == "healthy"
+    assert current.last_keepalive_at is not None
+    assert current.last_keepalive_error is None
+    assert current.consecutive_keepalive_failures == 0
+
+
+def test_keepalive_status_can_refresh_immediately(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    class FakeClient:
+        def keep_alive_assignment(self, endpoint):
+            assert endpoint == "endpoint"
+
+    async def scenario():
+        instance.client = lambda: FakeClient()
+        result = await instance.keepalive("runtime", refresh=True)
+        await instance.shutdown_keepalives()
+        return result
+
+    result = asyncio.run(scenario())
+    assert result["status"] == "healthy"
+    assert result["refresh_succeeded"] is True
+    assert result["background_task_running"] is True
+    assert result["guarantees_runtime_persistence"] is False
+
+
+def test_server_restart_recovers_active_keepalives_and_marks_lost_leases(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("active", "endpoint-active"))
+    instance.store.add(session("lost", "endpoint-lost"))
+    recovered = []
+
+    class FakeClient:
+        def list_assignments(self):
+            return [SimpleNamespace(endpoint="endpoint-active")]
+
+    instance.client = lambda: FakeClient()
+    instance.ensure_keepalive = lambda value: recovered.append(value.name)
+    result = asyncio.run(instance.recover_keepalives())
+
+    assert result == {"recovered": ["active"], "lease_lost": ["lost"], "error": None}
+    assert recovered == ["active"]
+    assert instance.store.get("lost").keepalive_status == "lease_lost"
+
+
+def test_keepalive_recovery_with_no_sessions_never_contacts_colab(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.client = lambda: (_ for _ in ()).throw(AssertionError("must stay offline"))
+
+    assert asyncio.run(instance.recover_keepalives()) == {
+        "recovered": [],
+        "lease_lost": [],
+        "error": None,
+    }
+
+
 def test_allocation_probe_observes_owned_lease_and_runtime_incarnation(tmp_path, monkeypatch):
     instance = manager(tmp_path, monkeypatch)
     instance.store.add(session("runtime", "endpoint"))

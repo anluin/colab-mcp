@@ -37,6 +37,11 @@ not. Inspect `last_known_process` and `diagnostic.probable_cause`; common causes
 recycling, runtime OOM/reset, or deleted remote process state. This is diagnostic evidence, not a
 guaranteed root-cause determination.
 
+Call `colab_keepalive(refresh=true)` when diagnosing an idle runtime. `healthy` means the upstream
+idle-timer ping was accepted; `degraded` records a transient failure that the background task will
+retry; `lease_lost` means the assignment was confirmed absent. A healthy ping cannot prevent
+Colab-enforced maximum lifetime, quota exhaustion, reclamation, or policy termination.
+
 ## Running process has empty output
 
 Current process runners persist each available stdout/stderr pipe write immediately. A process

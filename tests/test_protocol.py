@@ -28,6 +28,7 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_run_command",
                     "colab_process_export",
                     "colab_allocation_probe",
+                    "colab_keepalive",
                     "colab_stop",
                 } <= names
                 assert not health.isError

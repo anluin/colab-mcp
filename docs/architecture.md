@@ -36,6 +36,11 @@ and total byte counts without stopping the workload.
 Server shutdown does not silently terminate remotely running work. Local keep-alive tasks end with
 the event loop, while persisted assignment/process metadata enables a new server instance to
 reconnect. Compute release remains explicit and auditable.
+
+The server lifespan restores background keep-alive tasks for assignments that still exist upstream.
+Each task uses the pinned CLI client's Tunnel Frontend ping, records observable health in session
+state, retries transient failures, and stops when repeated failures are confirmed as a lost lease.
+Graceful shutdown cancels only local heartbeat tasks and never releases compute implicitly.
 If a kernel channel times out, idempotent status/read/list/introspection operations clear the stale
 kernel identity and reconnect once. Mutations and arbitrary code are never retried automatically
 because their outcome may be unknown and duplicate execution would be unsafe.
