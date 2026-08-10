@@ -43,6 +43,14 @@ Connection setup is tracked separately from execution: if setup fails before the
 sent, the client clears the stale kernel identity and retries once for any operation. Once code may
 have been sent, only idempotent operations are eligible for retry.
 
+Transfers begin with repeated upstream assignment observations, keep-alive refreshes, and a remote
+incarnation check. Individual filesystem calls retain their own incarnation guard, so stabilization
+does not weaken fail-fast runtime replacement detection during a transfer.
+
+Completed-process export is a local publication transaction. Data is checksummed into a sibling
+staging path, renamed into visibility only after the complete transfer succeeds, and optionally
+followed by explicit runtime release. Every failure path preserves the tracked assignment for retry.
+
 ## Upstream constraints
 
 Personal Colab has no supported VM suspend/snapshot operation, guaranteed accelerator inventory,

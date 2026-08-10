@@ -23,7 +23,13 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 health = await client.call_tool("colab_health", {})
                 compute_units = await client.call_tool("colab_compute_units", {})
                 assert initialized.serverInfo.name == "Google Colab Runtime"
-                assert {"colab_start", "colab_run_command", "colab_stop"} <= names
+                assert {
+                    "colab_start",
+                    "colab_run_command",
+                    "colab_process_export",
+                    "colab_allocation_probe",
+                    "colab_stop",
+                } <= names
                 assert not health.isError
                 assert not compute_units.isError
 

@@ -29,7 +29,13 @@ from src.manager import (
 
 def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ColabManager:
     monkeypatch.setenv("COLAB_MCP_STATE_DIR", str(tmp_path / "state"))
-    return ColabManager()
+    instance = ColabManager()
+
+    async def stable_probe(*_args, **_kwargs):
+        return {"status": "stable", "observations": 2}
+
+    instance.allocation_probe = stable_probe
+    return instance
 
 
 def test_require_local_file(tmp_path: Path):
@@ -430,6 +436,51 @@ def test_start_releases_runtime_when_incarnation_initialization_fails(tmp_path, 
     assert instance.store.get("runtime") is None
 
 
+def test_allocation_probe_observes_owned_lease_and_runtime_incarnation(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    keepalives = []
+
+    class FakeClient:
+        def list_assignments(self):
+            return [SimpleNamespace(endpoint="endpoint")]
+
+        def keep_alive_assignment(self, endpoint):
+            keepalives.append(endpoint)
+
+    async def remote(operation, payload, name, timeout=120):
+        assert (operation, payload, name) == ("lease_probe", {}, "runtime")
+        return {
+            "status": "stable",
+            "runtime_fingerprint": "a" * 32,
+            "observed_at": "2026-08-10T00:00:00+00:00",
+        }
+
+    instance.client = lambda: FakeClient()
+    instance._remote_operation = remote
+    result = asyncio.run(
+        ColabManager.allocation_probe(instance, "runtime", observations=3, interval=0)
+    )
+
+    assert result["status"] == "stable"
+    assert result["observations"] == 3
+    assert result["runtime_fingerprint"] == "a" * 32
+    assert keepalives == ["endpoint", "endpoint", "endpoint"]
+
+
+def test_allocation_probe_fails_before_remote_access_when_lease_is_lost(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    class FakeClient:
+        def list_assignments(self):
+            return []
+
+    instance.client = lambda: FakeClient()
+    with pytest.raises(RuntimeError, match="allocation_lease_lost"):
+        asyncio.run(ColabManager.allocation_probe(instance, "runtime", interval=0))
+
+
 def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     instance = manager(tmp_path, monkeypatch)
     instance.store.add(session("runtime", "endpoint"))
@@ -507,8 +558,14 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
     writes = []
     moves = []
     removes = []
+    events = []
+
+    async def probe(*_args, **_kwargs):
+        events.append("probe")
+        return {"status": "stable", "observations": 2}
 
     async def stat_or_none(*_args, **_kwargs):
+        events.append("stat")
         return None
 
     async def write(path, data, name, append=False, create_parents=False):
@@ -524,6 +581,7 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
         removes.append((path, missing_ok))
 
     instance._remote_stat_or_none = stat_or_none
+    instance.allocation_probe = probe
     instance.filesystem_write = write
     instance.filesystem_stat = stat
     instance.filesystem_move = move
@@ -536,6 +594,8 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
     assert moves[0][1:] == ("/content/destination.bin", False)
     assert removes[0][1] is True
     assert result["files_transferred"][0]["sha256"] == expected_checksum
+    assert result["lease"]["status"] == "stable"
+    assert events[:2] == ["probe", "stat"]
 
 
 def test_upload_interruption_cleans_remote_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -659,3 +719,134 @@ def test_legacy_transfer_aliases_use_bounded_verified_implementation(
         ("upload", "local", "/content/remote", "runtime"),
         ("download", "/content/remote", "local", "runtime"),
     ]
+
+
+def test_process_export_atomically_publishes_then_explicitly_releases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    stopped = []
+
+    async def status(*_args):
+        return {"process_id": "process", "status": "exited", "exit_code": 0}
+
+    async def download(remote, local, name, **_kwargs):
+        Path(local).write_bytes(b"artifact")
+        return {
+            "files_transferred": [
+                {"remote_path": remote, "local_path": local, "size": 8, "sha256": "digest"}
+            ],
+            "files_skipped": [],
+            "total_bytes": 8,
+            "lease": {"status": "stable"},
+        }
+
+    async def stop(name):
+        stopped.append(name)
+        return {"stopped": name, "runtime_was_active": True}
+
+    instance.process_status = status
+    instance.transfer_download = download
+    instance.stop = stop
+    destination = tmp_path / "published.bin"
+    result = asyncio.run(
+        instance.process_export(
+            "process", "/content/artifact.bin", str(destination), "runtime", True
+        )
+    )
+
+    assert destination.read_bytes() == b"artifact"
+    assert result["exported"] is True
+    assert result["disposition"] == "released"
+    assert result["transfer"]["files_transferred"][0]["local_path"] == str(destination)
+    assert stopped == ["runtime"]
+    assert not list(tmp_path.glob("*.colab-mcp-export-*"))
+
+
+def test_process_export_failure_holds_runtime_and_removes_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    async def status(*_args):
+        return {"process_id": "process", "status": "exited", "exit_code": 0}
+
+    async def download(_remote, local, _name, **_kwargs):
+        Path(local).write_bytes(b"partial")
+        raise OSError("connection interrupted")
+
+    async def stop(_name):
+        raise AssertionError("failed export must not release the runtime")
+
+    instance.process_status = status
+    instance.transfer_download = download
+    instance.stop = stop
+    destination = tmp_path / "published.bin"
+    result = asyncio.run(
+        instance.process_export(
+            "process", "/content/artifact.bin", str(destination), "runtime", True
+        )
+    )
+
+    assert result["exported"] is False
+    assert result["disposition"] == "held"
+    assert result["error"]["code"] == "export_failed_runtime_held"
+    assert not destination.exists()
+    assert not list(tmp_path.glob("*.colab-mcp-export-*"))
+
+
+def test_process_export_holds_while_owned_process_is_running(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    async def status(*_args):
+        return {"process_id": "process", "status": "running", "argv": ["worker"]}
+
+    instance.process_status = status
+    result = asyncio.run(
+        instance.process_export(
+            "process", "/content/artifact.bin", str(tmp_path / "artifact"), "runtime", True
+        )
+    )
+
+    assert result["exported"] is False
+    assert result["disposition"] == "held"
+    assert result["error"]["code"] == "process_not_finished"
+    assert result["last_known_process"]["argv"] == ["worker"]
+
+
+def test_process_export_keeps_published_artifact_when_release_fails(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    async def status(*_args):
+        return {"process_id": "process", "status": "exited", "exit_code": 0}
+
+    async def download(remote, local, name, **_kwargs):
+        Path(local).write_bytes(b"artifact")
+        return {
+            "files_transferred": [{"remote_path": remote, "local_path": local}],
+            "files_skipped": [],
+            "total_bytes": 8,
+            "lease": {"status": "stable"},
+        }
+
+    async def stop(_name):
+        raise OSError("quota API unavailable")
+
+    instance.process_status = status
+    instance.transfer_download = download
+    instance.stop = stop
+    destination = tmp_path / "published.bin"
+    result = asyncio.run(
+        instance.process_export(
+            "process", "/content/artifact.bin", str(destination), "runtime", True
+        )
+    )
+
+    assert destination.read_bytes() == b"artifact"
+    assert result["exported"] is True
+    assert result["disposition"] == "held"
+    assert result["error"]["code"] == "release_failed_runtime_held"

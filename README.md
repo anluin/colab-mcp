@@ -112,7 +112,8 @@ uv --directory /absolute/path/to/colab-mcp run --locked colab-mcp serve
 
 Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`,
 `colab_run_command`, `colab_process_start`, `colab_process_status`, `colab_process_list`,
-`colab_process_output`, `colab_process_signal`, `colab_execute`, `colab_execute_notebook`,
+`colab_process_output`, `colab_process_signal`, `colab_process_export`, `colab_execute`,
+`colab_execute_notebook`, `colab_allocation_probe`,
 `colab_fs_list`, `colab_fs_stat`, `colab_fs_read`, `colab_fs_write`, `colab_fs_mkdir`,
 `colab_fs_move`, `colab_fs_remove`,
 `colab_transfer_upload`, `colab_transfer_download`,
@@ -172,6 +173,18 @@ with the same SHA-256 are skipped when `sync=true`; differing destinations requi
 destination. A failed call removes its partial file before returning an error.
 The shorter `colab_upload` and `colab_download` names are compatibility aliases for the same bounded,
 verified implementation; they do not bypass its limits.
+
+Every transfer first performs a bounded allocation lease probe: it observes the owned endpoint
+twice, refreshes its lease, and verifies the runtime-incarnation marker before reading or mutating
+remote files. A missing assignment fails as `allocation_lease_lost`; a recycled backend continues
+to fail as `runtime_replaced`.
+
+After an owned process exits, `colab_process_export` downloads one file or directory into a hidden
+sibling staging path and publishes it locally with one filesystem rename. Any status, lease,
+transfer, checksum, publication, or release failure returns `disposition="held"` and leaves the
+runtime tracked. `release_on_success=false` is the safe default; setting it to true releases compute
+only after publication succeeds. Atomic overwrite of an existing directory is intentionally
+unsupported across platforms—export to a new destination instead.
 
 ### Crash recovery and orphan cleanup
 

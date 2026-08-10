@@ -58,6 +58,16 @@ outcome is unknown. Reconcile/stop the assignment, allocate a fresh runtime, and
 downloaded data. Download important results before notebook or other kernel-intensive work when
 possible.
 
+## Transfer lease probe fails
+
+`allocation_lease_lost` means the tracked endpoint disappeared during the pre-transfer stability
+window; reconcile the session before retrying. `runtime_replaced` means the endpoint no longer
+contains the expected runtime incarnation. Neither condition starts a partial transfer.
+
+If `colab_process_export` returns `disposition="held"`, the runtime remains tracked. Correct the
+reported status, destination, transfer, or release error and retry. A successfully published local
+artifact is retained even when the subsequent explicit release fails.
+
 ## GPU differs from the request
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,

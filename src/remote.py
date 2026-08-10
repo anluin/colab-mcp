@@ -249,6 +249,12 @@ try:
         _cm_process_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if _cm_operation == 'incarnation_init':
         pass
+    elif _cm_operation == 'lease_probe':
+        _cm_result = {{
+            'status': 'stable',
+            'runtime_fingerprint': _cm_actual_fingerprint,
+            'observed_at': _cm_datetime.datetime.now(_cm_datetime.timezone.utc).isoformat(),
+        }}
     elif _cm_operation == 'process_start':
         _cm_cwd = _cm_path(_cm_payload.get('cwd'))
         if not _cm_cwd.is_dir():

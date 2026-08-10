@@ -81,6 +81,7 @@ def test_process_output_reconciles_exit_count_with_live_spool_size():
     "operation",
     [
         "incarnation_init",
+        "lease_probe",
         "process_start",
         "process_status",
         "process_list",

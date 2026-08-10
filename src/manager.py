@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -566,6 +567,7 @@ class ColabManager:
                     "fs_stat",
                     "fs_read",
                     "inspect",
+                    "lease_probe",
                 }
                 if operation not in retryable:
                     raise
@@ -580,6 +582,45 @@ class ColabManager:
             self.store.add(session)
             logger.warning("runtime_replaced session=%s operation=%s", session.name, operation)
             raise self._replacement_error(session, str(error), payload.get("process_id")) from error
+
+    async def allocation_probe(
+        self,
+        name: str | None,
+        observations: int = 2,
+        interval: float = 0.25,
+    ) -> dict[str, Any]:
+        """Verify that an owned assignment and its runtime incarnation remain stable."""
+        if not 2 <= observations <= 5:
+            raise ValueError("observations must be between 2 and 5")
+        if not 0 <= interval <= 5:
+            raise ValueError("interval must be between 0 and 5 seconds")
+        session = self.resolve(name)
+        observed: list[str] = []
+        for index in range(observations):
+            assignments = await asyncio.to_thread(self.client().list_assignments)
+            endpoints = {item.endpoint for item in assignments}
+            current = self.store.get(session.name)
+            if current is None or current.endpoint != session.endpoint:
+                raise RuntimeError(
+                    "allocation_lease_changed: local session ownership changed during probe"
+                )
+            if session.endpoint not in endpoints:
+                raise RuntimeError(
+                    "allocation_lease_lost: the tracked Colab assignment is no longer active"
+                )
+            await asyncio.to_thread(self.client().keep_alive_assignment, session.endpoint)
+            observed.append(session.endpoint)
+            if index + 1 < observations and interval:
+                await asyncio.sleep(interval)
+        incarnation = await self._remote_operation("lease_probe", {}, session.name)
+        return {
+            "status": "stable",
+            "session": session.name,
+            "endpoint": session.endpoint,
+            "observations": len(observed),
+            "runtime_fingerprint": incarnation["runtime_fingerprint"],
+            "observed_at": incarnation["observed_at"],
+        }
 
     def _replacement_error(
         self, session: SessionState, reason: str, process_id: str | None = None
@@ -941,6 +982,7 @@ class ColabManager:
             raise ValueError(
                 f"Transfer contains {total} bytes; max_total_bytes is {max_total_bytes}"
             )
+        lease = await self.allocation_probe(name)
         remote_root = PurePosixPath(remote_path)
         transferred: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -992,7 +1034,12 @@ class ColabManager:
                 )
             finally:
                 await self.filesystem_remove(temporary, name, missing_ok=True)
-        return {"files_transferred": transferred, "files_skipped": skipped, "total_bytes": total}
+        return {
+            "files_transferred": transferred,
+            "files_skipped": skipped,
+            "total_bytes": total,
+            "lease": lease,
+        }
 
     async def _remote_files(
         self, path: str, name: str | None, max_files: int
@@ -1028,6 +1075,7 @@ class ColabManager:
     ) -> dict[str, Any]:
         """Download files through checksummed chunks and atomic local replacement."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
+        lease = await self.allocation_probe(name)
         root, files = await self._remote_files(remote_path, name, max_files)
         total = sum(int(item["size"]) for item in files)
         if total > max_total_bytes:
@@ -1101,7 +1149,112 @@ class ColabManager:
                 )
             finally:
                 temporary.unlink(missing_ok=True)
-        return {"files_transferred": transferred, "files_skipped": skipped, "total_bytes": total}
+        return {
+            "files_transferred": transferred,
+            "files_skipped": skipped,
+            "total_bytes": total,
+            "lease": lease,
+        }
+
+    async def process_export(
+        self,
+        process_id: str,
+        remote_path: str,
+        local_path: str,
+        name: str | None,
+        release_on_success: bool = False,
+        overwrite: bool = False,
+        chunk_size: int = 524_288,
+        max_total_bytes: int = 100_000_000,
+        max_files: int = 10_000,
+    ) -> dict[str, Any]:
+        """Atomically publish completed-process output locally, or retain its runtime."""
+        session = self.resolve(name)
+        status = await self.process_status(process_id, session.name)
+        if status.get("status") != "exited":
+            return {
+                "process_id": process_id,
+                "session": session.name,
+                "exported": False,
+                "disposition": "held",
+                "runtime_released": False,
+                "error": {
+                    "code": "process_not_finished",
+                    "message": "Owned process must have status=exited before export",
+                },
+                "last_known_process": status,
+            }
+
+        destination = Path(local_path).expanduser().resolve()
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        staged = destination.with_name(destination.name + ".colab-mcp-export-" + uuid.uuid4().hex)
+        transfer: dict[str, Any] | None = None
+        try:
+            if destination.exists() and not overwrite:
+                raise FileExistsError(f"Local destination exists: {destination}")
+            if destination.is_dir():
+                raise IsADirectoryError(
+                    "Atomic overwrite of an existing directory is not supported; choose a new path"
+                )
+            transfer = await self.transfer_download(
+                remote_path,
+                str(staged),
+                session.name,
+                overwrite=False,
+                sync=False,
+                chunk_size=chunk_size,
+                max_total_bytes=max_total_bytes,
+                max_files=max_files,
+            )
+            staged.replace(destination)
+            for item in transfer["files_transferred"]:
+                staged_item = Path(item["local_path"])
+                relative = staged_item.relative_to(staged) if staged_item != staged else None
+                item["local_path"] = str(
+                    destination if relative is None else destination / relative
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            return {
+                "process_id": process_id,
+                "session": session.name,
+                "exported": False,
+                "disposition": "held",
+                "runtime_released": False,
+                "error": {"code": "export_failed_runtime_held", "message": str(error)},
+                "last_known_process": status,
+            }
+        finally:
+            if staged.is_dir():
+                shutil.rmtree(staged, ignore_errors=True)
+            else:
+                staged.unlink(missing_ok=True)
+
+        result = {
+            "process_id": process_id,
+            "session": session.name,
+            "exported": True,
+            "local_path": str(destination),
+            "transfer": transfer,
+            "disposition": "held",
+            "runtime_released": False,
+        }
+        if not release_on_success:
+            return result
+        try:
+            stopped = await self.stop(session.name)
+        except Exception as error:
+            return {
+                **result,
+                "error": {"code": "release_failed_runtime_held", "message": str(error)},
+            }
+        return {
+            **result,
+            "disposition": "released",
+            "runtime_released": True,
+            "release": stopped,
+        }
 
     async def execute_notebook(
         self, source: str, output: str, name: str | None, timeout: float

@@ -143,6 +143,32 @@ async def colab_process_signal(
 
 
 @mcp.tool()
+async def colab_process_export(
+    process_id: str,
+    remote_path: str,
+    local_path: str,
+    session: str | None = None,
+    release_on_success: bool = False,
+    overwrite: bool = False,
+    chunk_size: int = 524_288,
+    max_total_bytes: int = 100_000_000,
+    max_files: int = 10_000,
+) -> dict:
+    """Atomically export completed-process files; hold the runtime on any failure."""
+    return await manager.process_export(
+        process_id,
+        remote_path,
+        local_path,
+        session,
+        release_on_success,
+        overwrite,
+        chunk_size,
+        max_total_bytes,
+        max_files,
+    )
+
+
+@mcp.tool()
 async def colab_fs_list(
     path: str = "/content", session: str | None = None, limit: int = 1_000
 ) -> dict:
@@ -234,6 +260,16 @@ async def colab_transfer_upload(
         max_total_bytes,
         max_files,
     )
+
+
+@mcp.tool()
+async def colab_allocation_probe(
+    session: str | None = None,
+    observations: int = 2,
+    interval: float = 0.25,
+) -> dict:
+    """Verify assignment ownership and runtime incarnation stability before critical work."""
+    return await manager.allocation_probe(session, observations, interval)
 
 
 @mcp.tool()
