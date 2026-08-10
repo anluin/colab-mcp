@@ -225,9 +225,10 @@ async def colab_execute(
             ge=1, le=1_000_000, description="Maximum returned output bytes; defaults to 100,000."
         ),
     ] = 100_000,
-) -> list[dict]:
-    """Execute bounded Python in an existing runtime and return Jupyter outputs."""
-    return await manager.execute_python(code, session, timeout, output_limit)
+    lease_token: LeaseToken = None,
+) -> dict:
+    """Execute lease-guarded Python and return outputs plus honest phase timings."""
+    return await manager.execute_python_detailed(code, session, timeout, output_limit, lease_token)
 
 
 @mcp.tool()

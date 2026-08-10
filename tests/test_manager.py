@@ -26,8 +26,10 @@ from src.manager import (
     KernelConnectionError,
     ManagedSessionState,
     OperationLeaseError,
+    RequestOutcomeUnknownError,
     TransferError,
     _bound_outputs,
+    _extract_control_timing,
     _json_safe,
     _secure_permissions,
     require_local_file,
@@ -623,6 +625,74 @@ def test_stale_operation_lease_is_rejected_before_assignment_lookup(tmp_path, mo
     assert caught.value.code == "operation_lease_stale"
 
 
+def test_guard_timing_is_extracted_without_leaking_control_output():
+    outputs = [
+        {
+            "output_type": "stream",
+            "text": (
+                '__COLAB_MCP_CONTROL_TIMING__{"fingerprint_validation_seconds":0.012}\n'
+                "user output\n"
+            ),
+        }
+    ]
+    assert _extract_control_timing(outputs) == {"fingerprint_validation_seconds": 0.012}
+    assert outputs[0]["text"] == "user output\n"
+
+
+def test_detailed_execute_is_lease_guarded_and_reports_control_timings(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    captured = []
+
+    async def detailed(code, *_args, **_kwargs):
+        captured.append(code)
+        return {
+            "outputs": [
+                {
+                    "output_type": "stream",
+                    "text": (
+                        '__COLAB_MCP_CONTROL_TIMING__{"fingerprint_validation_seconds":0.002}\nok\n'
+                    ),
+                }
+            ],
+            "timings": {"assignment_lookup_seconds": None, "total_seconds": 1.0},
+        }
+
+    instance._execute_detailed = detailed
+    result = asyncio.run(instance.execute_python_detailed("print('ok')", "runtime"))
+    assert captured and captured[0].index("operation-lease.json") < captured[0].index("print('ok')")
+    assert result["outputs"][0]["text"] == "ok\n"
+    assert result["timings"]["assignment_lookup_seconds"] == 0.001
+    assert result["timings"]["fingerprint_validation_seconds"] == 0.002
+
+
+def test_request_timeout_is_classified_as_submission_outcome_unknown(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    class TimeoutKernel:
+        id = "kernel"
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self, timeout):
+            pass
+
+        def execute(self, code, timeout):
+            if code.startswith("import os;"):
+                return {"outputs": []}
+            raise TimeoutError("late")
+
+        def stop(self, shutdown_kernel=False):
+            pass
+
+    monkeypatch.setattr("src.manager.jupyter_kernel_client.ColabKernelClient", TimeoutKernel)
+    with pytest.raises(RequestOutcomeUnknownError) as caught:
+        asyncio.run(instance.execute("print('x')", "runtime", 1, connection_attempts=1))
+    assert caught.value.code == "operation_timed_out_submission_outcome_unknown"
+    assert caught.value.details["request_submission"] == "outcome_unknown"
+
+
 def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     instance = manager(tmp_path, monkeypatch)
     instance.store.add(session("runtime", "endpoint"))
@@ -650,8 +720,9 @@ def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest
     monkeypatch.setattr(
         "src.manager.jupyter_kernel_client.ColabKernelClient", lambda **_kwargs: kernel
     )
-    with pytest.raises(OSError, match="kernel disappeared"):
+    with pytest.raises(RequestOutcomeUnknownError) as caught:
         asyncio.run(instance.execute_python("print('hello')", "runtime"))
+    assert caught.value.code == "request_submission_outcome_unknown_response_lost"
     assert kernel.stopped is True
 
 

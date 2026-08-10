@@ -153,6 +153,15 @@ class OperationLeaseError(RuntimeError):
         super().__init__(code + ": " + json.dumps(self.details, separators=(",", ":")))
 
 
+class RequestOutcomeUnknownError(RuntimeError):
+    """The synchronous upstream adapter raised after submission may have begun."""
+
+    def __init__(self, code: str, message: str, details: dict[str, Any]) -> None:
+        self.code = code
+        self.details = {"code": code, "message": message, **details}
+        super().__init__(code + ": " + json.dumps(self.details, separators=(",", ":")))
+
+
 class TransferError(RuntimeError):
     """A resumable transfer failed with explicit staging and submission state."""
 
@@ -163,6 +172,47 @@ class TransferError(RuntimeError):
 
 
 ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
+CONTROL_TIMING_PREFIX = "__COLAB_MCP_CONTROL_TIMING__"
+
+
+def _guarded_python_source(code: str, fingerprint: str, lease_token: str) -> str:
+    """Validate incarnation and lease in the same kernel request before user code starts."""
+    return f"""
+import datetime as __cm_datetime
+import json as __cm_json
+import pathlib as __cm_pathlib
+import time as __cm_time
+__cm_guard_started = __cm_time.monotonic()
+__cm_state = __cm_pathlib.Path('/content/.colab-mcp')
+__cm_actual = (__cm_state / 'runtime-incarnation').read_text(encoding='ascii').strip() if (__cm_state / 'runtime-incarnation').is_file() else None
+if __cm_actual != {fingerprint!r}:
+    raise RuntimeError('runtime_replaced: guarded execution observed a different incarnation')
+__cm_lease = __cm_json.loads((__cm_state / 'operation-lease.json').read_text(encoding='utf-8'))
+if __cm_lease.get('token') != {lease_token!r} or __cm_lease.get('runtime_fingerprint') != __cm_actual:
+    raise RuntimeError('operation_lease_stale: guarded execution lease does not match')
+if __cm_datetime.datetime.fromisoformat(__cm_lease['expires_at']) <= __cm_datetime.datetime.now(__cm_datetime.timezone.utc):
+    raise RuntimeError('operation_lease_expired: guarded execution lease expired')
+print({CONTROL_TIMING_PREFIX!r} + __cm_json.dumps({{'fingerprint_validation_seconds': round(__cm_time.monotonic() - __cm_guard_started, 6)}}))
+del __cm_datetime, __cm_json, __cm_pathlib, __cm_time, __cm_guard_started, __cm_state, __cm_actual, __cm_lease
+{code}
+"""
+
+
+def _extract_control_timing(outputs: list[dict[str, Any]]) -> dict[str, float]:
+    timings: dict[str, float] = {}
+    for output in outputs:
+        if output.get("output_type") != "stream":
+            continue
+        kept = []
+        for line in str(output.get("text", "")).splitlines(keepends=True):
+            stripped = line.rstrip("\r\n")
+            if stripped.startswith(CONTROL_TIMING_PREFIX):
+                value = json.loads(stripped[len(CONTROL_TIMING_PREFIX) :])
+                timings.update({key: float(item) for key, item in value.items()})
+            else:
+                kept.append(line)
+        output["text"] = "".join(kept)
+    return timings
 
 
 class ManagedSessionState(SessionState):
@@ -938,7 +988,7 @@ class ColabManager:
         )
         return result
 
-    async def execute(
+    async def _execute_detailed(
         self,
         code: str,
         name: str | None,
@@ -946,18 +996,20 @@ class ColabManager:
         output_limit: int = 100_000,
         connection_timeout: float = 60,
         connection_attempts: int = 2,
-    ) -> list[dict[str, Any]]:
+    ) -> dict[str, Any]:
         if not 1 <= output_limit <= 3_000_000:
             raise ValueError("output_limit must be between 1 and 3000000")
         session = self.resolve(name)
-        self.ensure_keepalive(session)
 
-        def run() -> list[dict[str, Any]]:
+        overall_started = time.monotonic()
+
+        def run() -> tuple[list[dict[str, Any]], dict[str, Any]]:
             # Use the Colab-specialized client directly. This avoids the CLI's
             # legacy KernelClient feature-detection path, which is unreliable
             # during circular package initialization on Windows.
             kernel = None
             connection_started = time.monotonic()
+            attempt_timings: dict[str, Any] = {}
             try:
                 try:
                     kernel = jupyter_kernel_client.ColabKernelClient(
@@ -969,12 +1021,19 @@ class ColabManager:
                         },
                     )
                     kernel.start(timeout=connection_timeout)
+                    attempt_timings["kernel_connection_seconds"] = round(
+                        time.monotonic() - connection_started, 3
+                    )
                     if not session.kernel_id and kernel.id:
                         session.kernel_id = kernel.id
                         self.store.add(session)
+                    preflight_started = time.monotonic()
                     kernel.execute(
                         "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
                         timeout=connection_timeout,
+                    )
+                    attempt_timings["kernel_preflight_seconds"] = round(
+                        time.monotonic() - preflight_started, 3
                     )
                 except Exception as error:
                     raise KernelConnectionError(
@@ -986,8 +1045,35 @@ class ColabManager:
                             "connection_timeout_seconds": connection_timeout,
                         },
                     ) from error
-                reply = kernel.execute(code, timeout=timeout)
-                return reply.get("outputs", []) if reply else []
+                request_started = time.monotonic()
+                try:
+                    reply = kernel.execute(code, timeout=timeout)
+                except TimeoutError as error:
+                    raise RequestOutcomeUnknownError(
+                        "operation_timed_out_submission_outcome_unknown",
+                        "The kernel adapter timed out after its execute call began.",
+                        {
+                            "phase": "request_submission_to_output_retrieval",
+                            "request_submission": "outcome_unknown",
+                            "elapsed_seconds": round(time.monotonic() - request_started, 3),
+                            "timeout_seconds": timeout,
+                        },
+                    ) from error
+                except OSError as error:
+                    raise RequestOutcomeUnknownError(
+                        "request_submission_outcome_unknown_response_lost",
+                        "The kernel channel failed after its execute call began.",
+                        {
+                            "phase": "request_submission_to_output_retrieval",
+                            "request_submission": "outcome_unknown",
+                            "elapsed_seconds": round(time.monotonic() - request_started, 3),
+                        },
+                    ) from error
+                attempt_timings["request_submission_to_output_retrieval_seconds"] = round(
+                    time.monotonic() - request_started, 3
+                )
+                attempt_timings["request_submission_confirmed"] = reply is not None
+                return (reply.get("outputs", []) if reply else []), attempt_timings
             finally:
                 if kernel is not None:
                     with contextlib.suppress(Exception):
@@ -995,10 +1081,31 @@ class ColabManager:
 
         if connection_attempts not in {1, 2}:
             raise ValueError("connection_attempts must be 1 or 2")
+        attempts: list[dict[str, Any]] = []
         for attempt in range(connection_attempts):
             try:
-                raw_outputs = await asyncio.to_thread(run)
-                return _bound_outputs(_json_safe(raw_outputs), output_limit)
+                raw_outputs, attempt_timing = await asyncio.to_thread(run)
+                attempts.append({"attempt": attempt + 1, **attempt_timing})
+                output_started = time.monotonic()
+                outputs = _bound_outputs(_json_safe(raw_outputs), output_limit)
+                output_processing_seconds = round(time.monotonic() - output_started, 3)
+                return {
+                    "outputs": outputs,
+                    "timings": {
+                        "assignment_lookup_seconds": None,
+                        "fingerprint_validation_seconds": None,
+                        "attempts": attempts,
+                        "retries": attempt,
+                        "retry_backoff_seconds": 0.0,
+                        "local_output_processing_seconds": output_processing_seconds,
+                        "total_seconds": round(time.monotonic() - overall_started, 3),
+                        "upstream_limitation": (
+                            "The pinned kernel client exposes submission, remote execution, and "
+                            "I/O collection as one synchronous interval. That combined interval is "
+                            "reported without inventing a split."
+                        ),
+                    },
+                }
             except KernelConnectionError as error:
                 if attempt + 1 >= connection_attempts:
                     error.details["retries"] = attempt
@@ -1009,6 +1116,25 @@ class ColabManager:
                     "kernel_connection_retry session=%s operation_not_sent=true", session.name
                 )
         raise AssertionError("unreachable")
+
+    async def execute(
+        self,
+        code: str,
+        name: str | None,
+        timeout: float,
+        output_limit: int = 100_000,
+        connection_timeout: float = 60,
+        connection_attempts: int = 2,
+    ) -> list[dict[str, Any]]:
+        result = await self._execute_detailed(
+            code,
+            name,
+            timeout,
+            output_limit,
+            connection_timeout,
+            connection_attempts,
+        )
+        return result["outputs"]
 
     async def execute_python(
         self,
@@ -1022,6 +1148,36 @@ class ColabManager:
         timeout = validate_timeout(timeout)
         output_limit = validate_output_limit(output_limit)
         return await self.execute(code, name, timeout, output_limit)
+
+    async def execute_python_detailed(
+        self,
+        code: str,
+        name: str | None,
+        timeout: float = 900,
+        output_limit: int = 100_000,
+        lease_token: str | None = None,
+    ) -> dict[str, Any]:
+        """Execute Python and expose honest control-plane/kernel phase timings."""
+        if not code or len(code.encode("utf-8")) > 1_000_000:
+            raise ValueError("code must contain between 1 and 1000000 UTF-8 bytes")
+        timeout = validate_timeout(timeout)
+        output_limit = validate_output_limit(output_limit)
+        session, lease = await self._operation_lease(name, lease_token)
+        result = await self._execute_detailed(
+            _guarded_python_source(
+                code, str(session.runtime_fingerprint), str(lease["lease_token"])
+            ),
+            session.name,
+            timeout,
+            output_limit,
+            connection_timeout=5,
+            connection_attempts=1,
+        )
+        control_timings = _extract_control_timing(result["outputs"])
+        result["timings"]["assignment_lookup_seconds"] = lease["assignment_lookup_seconds"]
+        result["timings"].update(control_timings)
+        result["lease"] = lease
+        return result
 
     async def _remote_operation(
         self,
@@ -1066,7 +1222,7 @@ class ColabManager:
                     )
                 else:
                     outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-            except (TimeoutError, OSError):
+            except (TimeoutError, OSError, RequestOutcomeUnknownError):
                 retryable = {
                     "process_status",
                     "process_list",

@@ -196,6 +196,11 @@ status/list results for `watching`, `degraded`, `completed`, or `held` and per-r
 All public MCP input properties carry schema descriptions. Optional fields state their default,
 units, bounds, selection behavior, or destructive effect directly in `tools/list`; agents should
 treat that generated schema as authoritative rather than guessing from parameter names.
+`colab_execute` is operation-lease guarded and returns `outputs`, `lease`, and `timings`. Timings
+separate assignment lookup, kernel connection, kernel preflight, local output processing, retries,
+and total duration. The upstream kernel client combines request submission, remote execution, and
+output retrieval into one synchronous interval, which is reported honestly as a combined phase.
+The remote fingerprint/lease guard duration is measured inside the same request.
 Every command is runtime-owned and receives a `process_id`. The timeout is only how long the MCP
 call waits: if it expires, `process_continues=true` and the command remains alive for later
 status/output/signal calls. Termination is always explicit. Python/Jupyter output is bounded to
@@ -310,7 +315,8 @@ CI runs on Ubuntu, macOS, and Windows with Python 3.12. The live integration has
 The Google Colab integration version is pinned to the live-tested release. This project imports its portable client components; it does not invoke the platform-limited CLI executable.
 
 Further documentation: [architecture](docs/architecture.md), [security model](docs/security.md),
-[troubleshooting](docs/troubleshooting.md), [contributing](CONTRIBUTING.md), and
+[error contract](docs/errors.md), [troubleshooting](docs/troubleshooting.md),
+[contributing](CONTRIBUTING.md), and
 [release procedure](docs/releasing.md). Version history and readiness evidence live in Git tags,
 commits, and GitHub release notes rather than duplicated version-specific repository files.
 
