@@ -1,23 +1,80 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Literal
+from typing import Annotated, Literal
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from .logging_config import configure_logging
-from .manager import COMPUTE_UNITS_URL, ColabManager
+from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager
 from .version import COLAB_CLI_VERSION, COLAB_MCP_VERSION
 
 manager = ColabManager()
+
+SessionName = Annotated[str, Field(description="Unique local name of a tracked Colab assignment.")]
+SessionSelector = Annotated[
+    str | None,
+    Field(
+        description="Tracked session name. Null is allowed only when exactly one session exists."
+    ),
+]
+ProcessId = Annotated[
+    str,
+    Field(description="Opaque process_id returned by colab_process_start or colab_run_command."),
+]
+Argv = Annotated[
+    list[str],
+    Field(
+        description="Non-empty executable and argument array; no shell parsing, expansion, or pipes."
+    ),
+]
+RemotePath = Annotated[
+    str,
+    Field(description="Runtime path confined to /content; relative paths resolve under /content."),
+]
+LocalPath = Annotated[
+    str, Field(description="Path on the MCP host, resolved under the host user's permissions.")
+]
+WorkingDirectory = Annotated[
+    str, Field(description="Existing runtime directory under /content. Defaults to /content.")
+]
+Environment = Annotated[
+    dict[str, str] | None,
+    Field(description="Optional environment overrides. Values are never returned or journaled."),
+]
+Overwrite = Annotated[
+    bool, Field(description="When true, explicitly permit replacement of an existing destination.")
+]
+ChunkSize = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=1_000_000,
+        description="Transfer chunk size in bytes; 1-1,000,000. Defaults to 524,288.",
+    ),
+]
+MaxTotalBytes = Annotated[
+    int,
+    Field(
+        ge=1,
+        le=10_000_000_000,
+        description="Hard total transfer limit in bytes; checked before publication.",
+    ),
+]
+MaxFiles = Annotated[
+    int, Field(ge=1, le=100_000, description="Hard file-count limit for a directory transfer.")
+]
 
 
 @asynccontextmanager
 async def server_lifespan(_server: FastMCP):
     await manager.recover_keepalives()
+    await manager.recover_process_export_watchers()
     try:
         yield
     finally:
+        await manager.shutdown_process_export_watchers()
         await manager.shutdown_keepalives()
 
 
@@ -55,36 +112,71 @@ async def colab_sessions() -> list[dict]:
 
 
 @mcp.tool()
-async def colab_keepalive(session: str | None = None, refresh: bool = True) -> dict:
+async def colab_keepalive(
+    session: SessionSelector = None,
+    refresh: Annotated[
+        bool, Field(description="True sends a ping now; false only reports persisted/task state.")
+    ] = True,
+) -> dict:
     """Report heartbeat health and optionally refresh the Colab idle timer immediately."""
     return await manager.keepalive(session, refresh)
 
 
 @mcp.tool()
-async def colab_reconcile(forget_stale: bool = False, release_orphans: bool = False) -> dict:
+async def colab_reconcile(
+    forget_stale: Annotated[
+        bool,
+        Field(description="Delete local records for assignments confirmed absent; default false."),
+    ] = False,
+    release_orphans: Annotated[
+        bool,
+        Field(
+            description="Release every live account assignment not owned here; destructive, default false."
+        ),
+    ] = False,
+) -> dict:
     """Audit local versus live assignments; cleanup actions require explicit flags."""
     return await manager.reconcile(forget_stale, release_orphans)
 
 
 @mcp.tool()
 async def colab_inspect(
-    session: str | None = None,
-    tools: list[str] | None = None,
-    process_limit: int = 100,
+    session: SessionSelector = None,
+    tools: Annotated[
+        list[str] | None,
+        Field(description="Executable names to locate; null uses the documented default tool set."),
+    ] = None,
+    process_limit: Annotated[
+        int, Field(ge=1, le=1_000, description="Maximum OS process rows returned; defaults to 100.")
+    ] = 100,
 ) -> dict:
     """Inspect OS, Python, CPU, RAM, disk, GPU/CUDA, tools, and bounded processes."""
     return await manager.inspect_runtime(session, tools, process_limit)
 
 
 @mcp.tool()
-def colab_create_notebook(path: str, code_cells: list[str] | None = None) -> dict:
+def colab_create_notebook(
+    path: Annotated[
+        str, Field(description="New local .ipynb path; existing files are never replaced.")
+    ],
+    code_cells: Annotated[
+        list[str] | None,
+        Field(description="Optional ordered Python source cells; null creates none."),
+    ] = None,
+) -> dict:
     """Create a new local Colab-ready .ipynb notebook without consuming GPU quota."""
     return manager.create_notebook(path, code_cells)
 
 
 @mcp.tool()
 async def colab_start(
-    session: str, gpu: Literal["T4", "L4", "G4", "H100", "A100"] | None = "T4"
+    session: SessionName,
+    gpu: Annotated[
+        Literal["T4", "L4", "G4", "H100", "A100"] | None,
+        Field(
+            description="Requested GPU model; null requests CPU. T4 is the default, not guaranteed."
+        ),
+    ] = "T4",
 ) -> dict:
     """Allocate a Colab CPU or GPU runtime under the authenticated personal account."""
     result = await manager.start(session, gpu)
@@ -93,10 +185,17 @@ async def colab_start(
 
 @mcp.tool()
 async def colab_execute(
-    code: str,
-    session: str | None = None,
-    timeout: float = 900,
-    output_limit: int = 100_000,
+    code: Annotated[str, Field(description="Python source executed through the runtime kernel.")],
+    session: SessionSelector = None,
+    timeout: Annotated[
+        float, Field(ge=0.1, le=21_600, description="Maximum wait in seconds; defaults to 900.")
+    ] = 900,
+    output_limit: Annotated[
+        int,
+        Field(
+            ge=1, le=1_000_000, description="Maximum returned output bytes; defaults to 100,000."
+        ),
+    ] = 100_000,
 ) -> list[dict]:
     """Execute bounded Python in an existing runtime and return Jupyter outputs."""
     return await manager.execute_python(code, session, timeout, output_limit)
@@ -104,12 +203,22 @@ async def colab_execute(
 
 @mcp.tool()
 async def colab_run_command(
-    argv: list[str],
-    session: str | None = None,
-    cwd: str = "/content",
-    environment: dict[str, str] | None = None,
-    timeout: float = 300,
-    output_limit: int = 100_000,
+    argv: Argv,
+    session: SessionSelector = None,
+    cwd: WorkingDirectory = "/content",
+    environment: Environment = None,
+    timeout: Annotated[
+        float,
+        Field(
+            ge=0.1,
+            le=21_600,
+            description="Handoff wait in seconds; timeout leaves the durable process running.",
+        ),
+    ] = 300,
+    output_limit: Annotated[
+        int,
+        Field(ge=1, le=1_000_000, description="Maximum stdout/stderr bytes returned per stream."),
+    ] = 100_000,
 ) -> dict:
     """Wait for a durable command; on timeout return process_id and leave it running."""
     return await manager.run_command(argv, session, cwd, environment, timeout, output_limit)
@@ -117,35 +226,56 @@ async def colab_run_command(
 
 @mcp.tool()
 async def colab_process_start(
-    argv: list[str],
-    session: str | None = None,
-    cwd: str = "/content",
-    environment: dict[str, str] | None = None,
-    output_limit: int = 10_000_000,
+    argv: Argv,
+    session: SessionSelector = None,
+    cwd: WorkingDirectory = "/content",
+    environment: Environment = None,
+    output_limit: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=1_000_000_000,
+            description="Durable byte cap for each output stream; defaults to 10,000,000.",
+        ),
+    ] = 10_000_000,
+    export_on_exit: Annotated[
+        list[AutoExportRule] | None,
+        Field(
+            description="Optional durable auto-export rules. They poll in the MCP background, survive server restart, and never release the runtime."
+        ),
+    ] = None,
 ) -> dict:
-    """Start a command; persist at most output_limit bytes for each output stream."""
-    return await manager.process_start(argv, session, cwd, environment, output_limit)
+    """Start a durable command; optional exit-code rules auto-export without releasing compute."""
+    return await manager.process_start(
+        argv, session, cwd, environment, output_limit, export_on_exit
+    )
 
 
 @mcp.tool()
-async def colab_process_status(process_id: str, session: str | None = None) -> dict:
+async def colab_process_status(process_id: ProcessId, session: SessionSelector = None) -> dict:
     """Inspect a process previously started in the selected runtime."""
     return await manager.process_status(process_id, session)
 
 
 @mcp.tool()
-async def colab_process_list(session: str | None = None) -> list[dict]:
+async def colab_process_list(session: SessionSelector = None) -> list[dict]:
     """List processes owned by colab-mcp in the selected runtime."""
     return await manager.process_list(session)
 
 
 @mcp.tool()
 async def colab_process_output(
-    process_id: str,
-    session: str | None = None,
-    stream: Literal["stdout", "stderr"] = "stdout",
-    offset: int = 0,
-    limit: int = 65_536,
+    process_id: ProcessId,
+    session: SessionSelector = None,
+    stream: Annotated[
+        Literal["stdout", "stderr"], Field(description="Output stream to read; defaults to stdout.")
+    ] = "stdout",
+    offset: Annotated[
+        int, Field(ge=0, description="Byte offset in the retained spool; use prior next_offset.")
+    ] = 0,
+    limit: Annotated[
+        int, Field(ge=1, le=1_000_000, description="Maximum bytes returned; defaults to 65,536.")
+    ] = 65_536,
 ) -> dict:
     """Read a bounded output chunk; pass next_offset to continue incrementally."""
     return await manager.process_output(process_id, session, stream, offset, limit)
@@ -153,9 +283,12 @@ async def colab_process_output(
 
 @mcp.tool()
 async def colab_process_signal(
-    process_id: str,
-    session: str | None = None,
-    signal: Literal["TERM", "KILL", "INT"] = "TERM",
+    process_id: ProcessId,
+    session: SessionSelector = None,
+    signal: Annotated[
+        Literal["TERM", "KILL", "INT"],
+        Field(description="Explicit process-group signal; TERM default, KILL is immediate."),
+    ] = "TERM",
 ) -> dict:
     """Signal a running process owned by colab-mcp in the selected runtime."""
     return await manager.process_signal(process_id, session, signal)
@@ -163,15 +296,20 @@ async def colab_process_signal(
 
 @mcp.tool()
 async def colab_process_export(
-    process_id: str,
-    remote_path: str,
-    local_path: str,
-    session: str | None = None,
-    release_on_success: bool = False,
-    overwrite: bool = False,
-    chunk_size: int = 524_288,
-    max_total_bytes: int = 100_000_000,
-    max_files: int = 10_000,
+    process_id: ProcessId,
+    remote_path: RemotePath,
+    local_path: LocalPath,
+    session: SessionSelector = None,
+    release_on_success: Annotated[
+        bool,
+        Field(
+            description="True releases the runtime only after verified publication; default false."
+        ),
+    ] = False,
+    overwrite: Overwrite = False,
+    chunk_size: ChunkSize = 524_288,
+    max_total_bytes: MaxTotalBytes = 100_000_000,
+    max_files: MaxFiles = 10_000,
 ) -> dict:
     """Atomically export completed-process files; hold the runtime on any failure."""
     return await manager.process_export(
@@ -189,24 +327,36 @@ async def colab_process_export(
 
 @mcp.tool()
 async def colab_fs_list(
-    path: str = "/content", session: str | None = None, limit: int = 1_000
+    path: Annotated[
+        str, Field(description="Runtime directory under /content; defaults to /content.")
+    ] = "/content",
+    session: SessionSelector = None,
+    limit: Annotated[int, Field(ge=1, le=10_000, description="Maximum entries returned.")] = 1_000,
 ) -> dict:
     """List a bounded number of entries under /content in the selected runtime."""
     return await manager.filesystem_list(path, session, limit)
 
 
 @mcp.tool()
-async def colab_fs_stat(path: str, session: str | None = None, checksum: bool = False) -> dict:
+async def colab_fs_stat(
+    path: RemotePath,
+    session: SessionSelector = None,
+    checksum: Annotated[
+        bool, Field(description="True computes SHA-256 for a file; default false.")
+    ] = False,
+) -> dict:
     """Inspect a runtime path; optionally calculate SHA-256 for a file."""
     return await manager.filesystem_stat(path, session, checksum)
 
 
 @mcp.tool()
 async def colab_fs_read(
-    path: str,
-    session: str | None = None,
-    offset: int = 0,
-    limit: int = 262_144,
+    path: RemotePath,
+    session: SessionSelector = None,
+    offset: Annotated[int, Field(ge=0, description="Byte offset; defaults to zero.")] = 0,
+    limit: Annotated[
+        int, Field(ge=1, le=1_000_000, description="Maximum bytes returned as base64.")
+    ] = 262_144,
 ) -> dict:
     """Read a bounded binary chunk as base64; use next_offset to continue."""
     return await manager.filesystem_read(path, session, offset, limit)
@@ -214,11 +364,18 @@ async def colab_fs_read(
 
 @mcp.tool()
 async def colab_fs_write(
-    path: str,
-    data_base64: str,
-    session: str | None = None,
-    append: bool = False,
-    create_parents: bool = False,
+    path: RemotePath,
+    data_base64: Annotated[
+        str,
+        Field(description="Base64-encoded bytes; decoded payload is limited to 1,000,000 bytes."),
+    ],
+    session: SessionSelector = None,
+    append: Annotated[
+        bool, Field(description="True appends; false atomically replaces the file. Default false.")
+    ] = False,
+    create_parents: Annotated[
+        bool, Field(description="True creates missing parent directories; default false.")
+    ] = False,
 ) -> dict:
     """Atomically write up to 1 MB of base64 data, or explicitly append a chunk."""
     return await manager.filesystem_write(path, data_base64, session, append, create_parents)
@@ -226,10 +383,14 @@ async def colab_fs_write(
 
 @mcp.tool()
 async def colab_fs_mkdir(
-    path: str,
-    session: str | None = None,
-    parents: bool = True,
-    exist_ok: bool = True,
+    path: RemotePath,
+    session: SessionSelector = None,
+    parents: Annotated[
+        bool, Field(description="True creates missing ancestors; defaults to true.")
+    ] = True,
+    exist_ok: Annotated[
+        bool, Field(description="True accepts an existing directory; defaults to true.")
+    ] = True,
 ) -> dict:
     """Create a directory under /content."""
     return await manager.filesystem_mkdir(path, session, parents, exist_ok)
@@ -237,10 +398,10 @@ async def colab_fs_mkdir(
 
 @mcp.tool()
 async def colab_fs_move(
-    source: str,
-    destination: str,
-    session: str | None = None,
-    overwrite: bool = False,
+    source: Annotated[str, Field(description="Existing source path under /content.")],
+    destination: Annotated[str, Field(description="Destination path under /content.")],
+    session: SessionSelector = None,
+    overwrite: Overwrite = False,
 ) -> dict:
     """Move a runtime file or directory; overwrite must be explicit."""
     return await manager.filesystem_move(source, destination, session, overwrite)
@@ -248,10 +409,14 @@ async def colab_fs_move(
 
 @mcp.tool()
 async def colab_fs_remove(
-    path: str,
-    session: str | None = None,
-    recursive: bool = False,
-    missing_ok: bool = False,
+    path: RemotePath,
+    session: SessionSelector = None,
+    recursive: Annotated[
+        bool, Field(description="Required to remove a non-empty directory; default false.")
+    ] = False,
+    missing_ok: Annotated[
+        bool, Field(description="True treats an absent path as success; default false.")
+    ] = False,
 ) -> dict:
     """Remove a runtime path; non-empty directories require recursive=true."""
     return await manager.filesystem_remove(path, session, recursive, missing_ok)
@@ -259,14 +424,16 @@ async def colab_fs_remove(
 
 @mcp.tool()
 async def colab_transfer_upload(
-    local_path: str,
-    remote_path: str,
-    session: str | None = None,
-    overwrite: bool = False,
-    sync: bool = True,
-    chunk_size: int = 524_288,
-    max_total_bytes: int = 100_000_000,
-    max_files: int = 10_000,
+    local_path: LocalPath,
+    remote_path: RemotePath,
+    session: SessionSelector = None,
+    overwrite: Overwrite = False,
+    sync: Annotated[
+        bool, Field(description="True skips destinations with the same SHA-256; defaults to true.")
+    ] = True,
+    chunk_size: ChunkSize = 524_288,
+    max_total_bytes: MaxTotalBytes = 100_000_000,
+    max_files: MaxFiles = 10_000,
 ) -> dict:
     """Upload a file/directory with staged chunks, SHA-256 verification, and sync skips."""
     return await manager.transfer_upload(
@@ -283,9 +450,13 @@ async def colab_transfer_upload(
 
 @mcp.tool()
 async def colab_allocation_probe(
-    session: str | None = None,
-    observations: int = 2,
-    interval: float = 0.25,
+    session: SessionSelector = None,
+    observations: Annotated[
+        int, Field(ge=2, le=5, description="Assignment observations; 2-5, defaults to 2.")
+    ] = 2,
+    interval: Annotated[
+        float, Field(ge=0, le=5, description="Seconds between observations; defaults to 0.25.")
+    ] = 0.25,
 ) -> dict:
     """Verify assignment ownership and runtime incarnation stability before critical work."""
     return await manager.allocation_probe(session, observations, interval)
@@ -293,14 +464,16 @@ async def colab_allocation_probe(
 
 @mcp.tool()
 async def colab_transfer_download(
-    remote_path: str,
-    local_path: str,
-    session: str | None = None,
-    overwrite: bool = False,
-    sync: bool = True,
-    chunk_size: int = 524_288,
-    max_total_bytes: int = 100_000_000,
-    max_files: int = 10_000,
+    remote_path: RemotePath,
+    local_path: LocalPath,
+    session: SessionSelector = None,
+    overwrite: Overwrite = False,
+    sync: Annotated[
+        bool, Field(description="True skips local files with the same SHA-256; defaults to true.")
+    ] = True,
+    chunk_size: ChunkSize = 524_288,
+    max_total_bytes: MaxTotalBytes = 100_000_000,
+    max_files: MaxFiles = 10_000,
 ) -> dict:
     """Download a file/directory with bounded chunks, SHA-256, and atomic publication."""
     return await manager.transfer_download(
@@ -317,42 +490,63 @@ async def colab_transfer_download(
 
 @mcp.tool()
 async def colab_execute_notebook(
-    source: str, output: str, session: str | None = None, cell_timeout: float = 900
+    source: Annotated[str, Field(description="Existing local .ipynb input path.")],
+    output: Annotated[str, Field(description="Local output .ipynb path to create or replace.")],
+    session: SessionSelector = None,
+    cell_timeout: Annotated[
+        float, Field(ge=0.1, le=21_600, description="Maximum seconds per code cell.")
+    ] = 900,
 ) -> dict:
     """Execute code cells from a local notebook and save an output notebook locally."""
     return await manager.execute_notebook(source, output, session, cell_timeout)
 
 
 @mcp.tool()
-async def colab_upload(local_path: str, remote_path: str, session: str | None = None) -> dict:
+async def colab_upload(
+    local_path: LocalPath, remote_path: RemotePath, session: SessionSelector = None
+) -> dict:
     """Compatibility alias for bounded, checksummed colab_transfer_upload."""
     return await manager.upload(local_path, remote_path, session)
 
 
 @mcp.tool()
-async def colab_download(remote_path: str, local_path: str, session: str | None = None) -> dict:
+async def colab_download(
+    remote_path: RemotePath, local_path: LocalPath, session: SessionSelector = None
+) -> dict:
     """Compatibility alias for bounded, checksummed colab_transfer_download."""
     return await manager.download(remote_path, local_path, session)
 
 
 @mcp.tool()
-async def colab_stop(session: str | None = None) -> dict:
+async def colab_stop(session: SessionSelector = None) -> dict:
     """Release a Colab runtime and cancel its in-process keep-alive task."""
     return await manager.stop(session)
 
 
 @mcp.tool()
-async def colab_pause_notebook(session: str, notebook_path: str) -> dict:
+async def colab_pause_notebook(
+    session: SessionName,
+    notebook_path: Annotated[str, Field(description="Existing local .ipynb checkpoint path.")],
+) -> dict:
     """Checkpoint a local notebook and release its Colab GPU; RAM and runtime files are not preserved."""
     return await manager.pause(session, notebook_path)
 
 
 @mcp.tool()
 async def colab_resume_notebook(
-    session: str,
-    execute_notebook: bool = False,
-    output_path: str | None = None,
-    cell_timeout: float = 900,
+    session: SessionName,
+    execute_notebook: Annotated[
+        bool, Field(description="True reruns the checkpoint on the fresh runtime; default false.")
+    ] = False,
+    output_path: Annotated[
+        str | None,
+        Field(
+            description="Local rerun output path; null generates <checkpoint>.resumed.ipynb when executing."
+        ),
+    ] = None,
+    cell_timeout: Annotated[
+        float, Field(ge=0.1, le=21_600, description="Maximum seconds per rerun code cell.")
+    ] = 900,
 ) -> dict:
     """Allocate a fresh runtime with the prior GPU preference and optionally rerun the paused notebook."""
     return await manager.resume(session, execute_notebook, output_path, cell_timeout)

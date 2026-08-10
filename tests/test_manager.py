@@ -18,6 +18,7 @@ from src.cli import (
     server_command,
 )
 from src.manager import (
+    AutoExportRule,
     ColabManager,
     ManagedSessionState,
     _bound_outputs,
@@ -933,3 +934,171 @@ def test_process_export_keeps_published_artifact_when_release_fails(tmp_path, mo
     assert result["exported"] is True
     assert result["disposition"] == "held"
     assert result["error"]["code"] == "release_failed_runtime_held"
+
+
+def test_process_start_persists_typed_auto_export_rules(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    watchers = []
+
+    async def remote(operation, payload, name, timeout=120):
+        assert operation == "process_start"
+        return {
+            "process_id": payload["process_id"],
+            "pid": 123,
+            "cwd": "/content",
+            "status": "running",
+        }
+
+    instance._remote_operation = remote
+    instance.ensure_process_export_watcher = lambda session_name, process_id: watchers.append(
+        (session_name, process_id)
+    )
+    destination = tmp_path / "artifact.bin"
+    result = asyncio.run(
+        instance.process_start(
+            ["worker"],
+            "runtime",
+            export_on_exit=[
+                AutoExportRule(
+                    remote_path="/content/artifact.bin",
+                    local_path=str(destination),
+                    exit_codes=[0, 2],
+                )
+            ],
+        )
+    )
+
+    rule = result["auto_export"]["rules"][0]
+    assert rule["local_path"] == str(destination.resolve())
+    assert rule["exit_codes"] == [0, 2]
+    assert result["auto_export"]["status"] == "watching"
+    assert watchers == [("runtime", result["process_id"])]
+
+
+def test_auto_export_watcher_selects_rules_by_exit_code(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    process_id = "process"
+    instance.process_journal.update(
+        "runtime",
+        {
+            "process_id": process_id,
+            "auto_export": {
+                "status": "watching",
+                "rules": [
+                    {
+                        "rule_id": "success",
+                        "remote_path": "/content/success.bin",
+                        "local_path": str(tmp_path / "success.bin"),
+                        "exit_codes": [0],
+                        "overwrite": False,
+                    },
+                    {
+                        "rule_id": "failure",
+                        "remote_path": "/content/failure.log",
+                        "local_path": str(tmp_path / "failure.log"),
+                        "exit_codes": [1],
+                        "overwrite": False,
+                    },
+                ],
+                "results": {},
+            },
+        },
+    )
+    exports = []
+
+    async def status(*_args):
+        return {"process_id": process_id, "status": "exited", "exit_code": 0}
+
+    async def export(_process_id, remote, local, _session, **_kwargs):
+        exports.append((remote, local))
+        return {"exported": True, "local_path": local}
+
+    instance.process_status = status
+    instance.process_export = export
+    asyncio.run(instance._watch_process_exports("runtime", process_id))
+
+    state = instance.process_journal.get("runtime", process_id)["auto_export"]
+    assert state["status"] == "completed"
+    assert state["results"]["success"]["status"] == "exported"
+    assert state["results"]["failure"]["status"] == "skipped"
+    assert exports == [("/content/success.bin", str(tmp_path / "success.bin"))]
+
+
+def test_auto_export_retries_failure_and_recovers_without_agent_polling(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    instance.export_poll_seconds = 0.01
+    process_id = "process"
+    instance.process_journal.update(
+        "runtime",
+        {
+            "process_id": process_id,
+            "auto_export": {
+                "status": "watching",
+                "rules": [
+                    {
+                        "rule_id": "export-0",
+                        "remote_path": "/content/artifact",
+                        "local_path": str(tmp_path / "artifact"),
+                        "exit_codes": None,
+                        "overwrite": False,
+                    }
+                ],
+                "results": {},
+            },
+        },
+    )
+    attempts = []
+
+    async def status(*_args):
+        return {"process_id": process_id, "status": "exited", "exit_code": 7}
+
+    async def export(*_args, **_kwargs):
+        attempts.append(True)
+        if len(attempts) == 1:
+            return {"exported": False, "error": {"code": "interrupted"}}
+        return {"exported": True}
+
+    instance.process_status = status
+    instance.process_export = export
+    asyncio.run(asyncio.wait_for(instance._watch_process_exports("runtime", process_id), 2))
+
+    state = instance.process_journal.get("runtime", process_id)["auto_export"]
+    assert len(attempts) == 2
+    assert state["status"] == "completed"
+    assert state["exit_code"] == 7
+
+
+def test_auto_export_recovery_reschedules_unfinished_watchers(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    instance.process_journal.update(
+        "runtime",
+        {
+            "process_id": "pending",
+            "auto_export": {"status": "degraded", "rules": [], "results": {}},
+        },
+    )
+    recovered = []
+    instance.ensure_process_export_watcher = lambda session_name, process_id: recovered.append(
+        (session_name, process_id)
+    )
+
+    result = asyncio.run(instance.recover_process_export_watchers())
+
+    assert result == {"recovered_process_ids": ["pending"]}
+    assert recovered == [("runtime", "pending")]
+
+
+def test_auto_export_rejects_duplicate_local_destinations(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    destination = str(tmp_path / "same")
+    rules = [
+        AutoExportRule(remote_path="/content/a", local_path=destination),
+        AutoExportRule(remote_path="/content/b", local_path=destination),
+    ]
+
+    with pytest.raises(ValueError, match="destinations must be unique"):
+        instance._normalize_auto_exports(rules)

@@ -56,6 +56,12 @@ Completed-process export is a local publication transaction. Data is checksummed
 staging path, renamed into visibility only after the complete transfer succeeds, and optionally
 followed by explicit runtime release. Every failure path preserves the tracked assignment for retry.
 
+Optional process auto-export rules are journaled with process ownership. In-memory watchers only
+schedule work; their source of truth is the owner-only journal, so server startup can recreate them.
+They poll status outside MCP request lifetimes, select rules by the recorded exit code, call the same
+atomic export primitive, persist each outcome, and retry failures with bounded backoff. They never
+release an assignment or infer artifacts from workload type.
+
 ## Upstream constraints
 
 Personal Colab has no supported VM suspend/snapshot operation, guaranteed accelerator inventory,

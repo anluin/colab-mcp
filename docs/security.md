@@ -26,6 +26,8 @@ runtimes are ephemeral execution environments.
 - Overwrite, append, recursive deletion, stale-record removal, and orphan release are explicit.
 - Transfers verify the owned allocation lease before remote access. Process export holds the
   runtime on every failure, and release after export requires `release_on_success=true`.
+- Auto-export destinations are explicit host paths persisted in owner-only process state. Rules are
+  capped, destinations must be unique, publication stays atomic, and automatic release is forbidden.
 - New endpoint ownership is persisted before preflight so cleanup failures remain discoverable.
 - Random runtime-incarnation markers prevent operations from crossing into a recycled Colab
   backend that happens to reuse an endpoint or kernel connection.

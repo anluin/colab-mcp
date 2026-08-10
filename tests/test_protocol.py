@@ -34,4 +34,16 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 assert not health.isError
                 assert not compute_units.isError
 
+                for tool in tools.tools:
+                    schema = tool.inputSchema
+                    for name, property_schema in schema.get("properties", {}).items():
+                        assert property_schema.get("description"), (
+                            f"{tool.name}.{name} must describe its semantics and default"
+                        )
+                    for definition_name, definition in schema.get("$defs", {}).items():
+                        for name, property_schema in definition.get("properties", {}).items():
+                            assert property_schema.get("description"), (
+                                f"{tool.name}.{definition_name}.{name} must be described"
+                            )
+
     asyncio.run(smoke())

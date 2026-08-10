@@ -13,7 +13,7 @@ import threading
 import time
 import uuid
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Annotated, Any
 
 import jupyter_kernel_client
 import nbformat
@@ -23,6 +23,7 @@ from colab_cli.state import SessionState, StateStore
 from google.auth.transport.requests import AuthorizedSession, Request
 from google.oauth2.credentials import Credentials
 from nbformat.v4 import new_output
+from pydantic import BaseModel, Field, field_validator
 
 from .remote import (
     DEFAULT_OUTPUT_LIMIT,
@@ -42,6 +43,65 @@ from .remote import (
 GPU_TYPES = {"T4", "L4", "G4", "H100", "A100"}
 COMPUTE_UNITS_URL = "https://colab.research.google.com/signup"
 logger = logging.getLogger("colab_mcp.manager")
+
+
+class AutoExportRule(BaseModel):
+    """A durable local export selected by the owned process's exit code."""
+
+    remote_path: Annotated[
+        str,
+        Field(description="File or directory under /content to download after process exit."),
+    ]
+    local_path: Annotated[
+        str,
+        Field(description="Absolute or host-relative destination; normalized to an absolute path."),
+    ]
+    exit_codes: Annotated[
+        list[int] | None,
+        Field(description="Matching exit codes; null matches every exit code. Defaults to [0]."),
+    ] = Field(default_factory=lambda: [0])
+    overwrite: Annotated[
+        bool,
+        Field(description="Replace an existing destination file; existing directories stay safe."),
+    ] = False
+    chunk_size: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=1_000_000,
+            description="Download chunk size in bytes; defaults to 524,288.",
+        ),
+    ] = 524_288
+    max_total_bytes: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=10_000_000_000,
+            description="Hard artifact size limit in bytes; defaults to 100,000,000.",
+        ),
+    ] = 100_000_000
+    max_files: Annotated[
+        int,
+        Field(
+            ge=1,
+            le=100_000,
+            description="Hard directory file-count limit; defaults to 10,000.",
+        ),
+    ] = 10_000
+
+    @field_validator("remote_path", "local_path")
+    @classmethod
+    def non_empty_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path must not be empty")
+        return value
+
+    @field_validator("exit_codes")
+    @classmethod
+    def bounded_exit_codes(cls, value: list[int] | None) -> list[int] | None:
+        if value is not None and (not value or len(value) > 256 or len(value) != len(set(value))):
+            raise ValueError("exit_codes must contain 1-256 unique integers or be null")
+        return value
 
 
 class KernelConnectionError(RuntimeError):
@@ -263,6 +323,8 @@ class ColabManager:
         self._client: Client | None = None
         self._keepalives: dict[str, asyncio.Task] = {}
         self.keepalive_seconds = int(os.environ.get("COLAB_MCP_KEEPALIVE_SECONDS", "60"))
+        self._export_watchers: dict[tuple[str, str], asyncio.Task] = {}
+        self.export_poll_seconds = float(os.environ.get("COLAB_MCP_EXPORT_POLL_SECONDS", "5"))
 
     def _read_suspended(self) -> dict[str, dict[str, Any]]:
         with self._suspended_lock:
@@ -436,6 +498,179 @@ class ColabManager:
         """Stop only local heartbeat tasks; runtime ownership remains persisted."""
         tasks = list(self._keepalives.values())
         self._keepalives.clear()
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _normalize_auto_exports(self, rules: list[AutoExportRule] | None) -> list[dict[str, Any]]:
+        if rules is None:
+            return []
+        if not 1 <= len(rules) <= 32:
+            raise ValueError("export_on_exit must contain between 1 and 32 rules")
+        normalized: list[dict[str, Any]] = []
+        destinations: set[str] = set()
+        for index, rule_value in enumerate(rules):
+            rule = (
+                rule_value
+                if isinstance(rule_value, AutoExportRule)
+                else AutoExportRule.model_validate(rule_value)
+            )
+            destination = str(Path(rule.local_path).expanduser().resolve())
+            if destination in destinations:
+                raise ValueError("export_on_exit local_path destinations must be unique")
+            destinations.add(destination)
+            normalized.append(
+                {
+                    "rule_id": f"export-{index}",
+                    "remote_path": rule.remote_path,
+                    "local_path": destination,
+                    "exit_codes": rule.exit_codes,
+                    "overwrite": rule.overwrite,
+                    "chunk_size": rule.chunk_size,
+                    "max_total_bytes": rule.max_total_bytes,
+                    "max_files": rule.max_files,
+                }
+            )
+        return normalized
+
+    def _update_auto_export(
+        self, session: str, process_id: str, **changes: Any
+    ) -> dict[str, Any] | None:
+        process = self.process_journal.get(session, process_id)
+        if process is None or "auto_export" not in process:
+            return None
+        state = {**process["auto_export"], **changes}
+        self.process_journal.update(session, {"process_id": process_id, "auto_export": state})
+        return state
+
+    def ensure_process_export_watcher(self, session: str, process_id: str) -> None:
+        process = self.process_journal.get(session, process_id)
+        state = process.get("auto_export") if process else None
+        if not state or state.get("status") in {"completed", "held", "skipped"}:
+            return
+        key = (session, process_id)
+        task = self._export_watchers.get(key)
+        if task is None or task.done():
+            self._export_watchers[key] = asyncio.create_task(
+                self._watch_process_exports(session, process_id)
+            )
+
+    async def _watch_process_exports(self, session: str, process_id: str) -> None:
+        delay = max(0.1, self.export_poll_seconds)
+        while True:
+            process = self.process_journal.get(session, process_id)
+            state = process.get("auto_export") if process else None
+            if not state:
+                return
+            try:
+                status = await self.process_status(process_id, session)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                self._update_auto_export(
+                    session,
+                    process_id,
+                    status="degraded",
+                    last_error=str(error)[:1_000],
+                    last_attempt_at=datetime.datetime.now(datetime.UTC).isoformat(),
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60)
+                continue
+            if status.get("status") == "running":
+                await asyncio.sleep(max(0.1, self.export_poll_seconds))
+                continue
+            if status.get("status") != "exited":
+                self._update_auto_export(
+                    session,
+                    process_id,
+                    status="held",
+                    last_error="process state was lost before automatic export",
+                    finished_process=status,
+                )
+                return
+
+            exit_code = status.get("exit_code")
+            results = dict(state.get("results") or {})
+            pending = False
+            for rule in state["rules"]:
+                rule_id = rule["rule_id"]
+                if results.get(rule_id, {}).get("status") in {"exported", "skipped"}:
+                    continue
+                exit_codes = rule.get("exit_codes")
+                if exit_codes is not None and exit_code not in exit_codes:
+                    results[rule_id] = {
+                        "status": "skipped",
+                        "reason": f"exit_code {exit_code} did not match {exit_codes}",
+                    }
+                    continue
+                try:
+                    exported = await self.process_export(
+                        process_id,
+                        rule["remote_path"],
+                        rule["local_path"],
+                        session,
+                        release_on_success=False,
+                        overwrite=bool(rule["overwrite"]),
+                        chunk_size=int(rule.get("chunk_size", 524_288)),
+                        max_total_bytes=int(rule.get("max_total_bytes", 100_000_000)),
+                        max_files=int(rule.get("max_files", 10_000)),
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    exported = {
+                        "exported": False,
+                        "error": {"code": "auto_export_error", "message": str(error)[:1_000]},
+                    }
+                if exported.get("exported"):
+                    transfer = exported.get("transfer") or {}
+                    results[rule_id] = {
+                        "status": "exported",
+                        "local_path": exported.get("local_path"),
+                        "total_bytes": transfer.get("total_bytes"),
+                        "files_transferred": len(transfer.get("files_transferred") or []),
+                        "files_skipped": len(transfer.get("files_skipped") or []),
+                    }
+                else:
+                    pending = True
+                    results[rule_id] = {
+                        "status": "degraded",
+                        "error": exported.get("error"),
+                    }
+            complete = not pending and all(
+                item.get("status") in {"exported", "skipped"} for item in results.values()
+            )
+            self._update_auto_export(
+                session,
+                process_id,
+                status="completed" if complete else "degraded",
+                exit_code=exit_code,
+                results=results,
+                last_error=None if complete else "one or more automatic exports will be retried",
+                last_attempt_at=datetime.datetime.now(datetime.UTC).isoformat(),
+            )
+            if complete:
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+    async def recover_process_export_watchers(self) -> dict[str, list[str]]:
+        recovered: list[str] = []
+        for session in self.store.list().values():
+            if getattr(session, "keepalive_status", None) == "lease_lost":
+                continue
+            for process in self.process_journal.list(session.name):
+                state = process.get("auto_export")
+                if state and state.get("status") not in {"completed", "held", "skipped"}:
+                    self.ensure_process_export_watcher(session.name, process["process_id"])
+                    recovered.append(process["process_id"])
+        return {"recovered_process_ids": recovered}
+
+    async def shutdown_process_export_watchers(self) -> None:
+        tasks = list(self._export_watchers.values())
+        self._export_watchers.clear()
         for task in tasks:
             task.cancel()
         if tasks:
@@ -839,11 +1074,13 @@ class ColabManager:
         cwd: str = "/content",
         environment: dict[str, str] | None = None,
         output_limit: int = DEFAULT_PROCESS_OUTPUT_LIMIT,
+        export_on_exit: list[AutoExportRule] | None = None,
     ) -> dict[str, Any]:
         """Start a detached process whose metadata and logs live on the runtime."""
         validate_argv(argv)
         environment = validate_environment(environment)
         output_limit = validate_process_output_limit(output_limit)
+        export_rules = self._normalize_auto_exports(export_on_exit)
         result = await self._remote_operation(
             "process_start",
             {
@@ -856,16 +1093,33 @@ class ColabManager:
             name,
         )
         session = self.resolve(name)
-        self.process_journal.update(
+        journaled = self.process_journal.update(
             session.name,
             {
                 **result,
                 "session": session.name,
                 "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+                **(
+                    {
+                        "auto_export": {
+                            "status": "watching",
+                            "rules": export_rules,
+                            "results": {},
+                            "configured_at": datetime.datetime.now(datetime.UTC).isoformat(),
+                        }
+                    }
+                    if export_rules
+                    else {}
+                ),
             },
         )
+        if export_rules:
+            self.ensure_process_export_watcher(session.name, result["process_id"])
         logger.info("process_started session=%s process_id=%s", name, result["process_id"])
-        return result
+        return {
+            **result,
+            **({"auto_export": journaled["auto_export"]} if export_rules else {}),
+        }
 
     async def process_status(self, process_id: str, name: str | None) -> dict[str, Any]:
         session = self.resolve(name)
@@ -1411,6 +1665,18 @@ class ColabManager:
 
     async def stop(self, name: str | None) -> dict[str, Any]:
         session = self.resolve(name)
+        watcher_tasks = [
+            task
+            for (watcher_session, _process_id), task in self._export_watchers.items()
+            if watcher_session == session.name
+        ]
+        self._export_watchers = {
+            key: task for key, task in self._export_watchers.items() if key[0] != session.name
+        }
+        for watcher in watcher_tasks:
+            watcher.cancel()
+        if watcher_tasks:
+            await asyncio.gather(*watcher_tasks, return_exceptions=True)
         task = self._keepalives.pop(session.name, None)
         if task:
             task.cancel()

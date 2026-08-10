@@ -73,6 +73,12 @@ If `colab_process_export` returns `disposition="held"`, the runtime remains trac
 reported status, destination, transfer, or release error and retry. A successfully published local
 artifact is retained even when the subsequent explicit release fails.
 
+For automatic exports, inspect `auto_export.results` through `colab_process_status` or
+`colab_process_list`. `degraded` means at least one matching rule failed and will be retried with
+backoff while the MCP server remains alive; restarting the server recreates unfinished watchers.
+`held` means the process/runtime state was lost before export and requires human or agent recovery.
+An unmatched exit-code rule is recorded as `skipped`, not as an error.
+
 ## GPU differs from the request
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,

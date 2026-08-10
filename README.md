@@ -160,6 +160,40 @@ Managed-process metadata is also journaled locally. If its remote record vanishe
 return `status="lost"`, the last known argv/cwd/PID/status, and a probable-cause diagnostic such as
 runtime recycling or OOM. After the first fingerprint mismatch, later file and process calls fail
 locally without reconnecting to the replacement backend.
+
+`colab_process_start` can also persist `export_on_exit` rules. Each rule names one runtime path,
+one local destination, the matching `exit_codes` (`null` means every code; omitted means `[0]`),
+whether an existing destination file may be replaced, and bounded transfer limits. A local
+background watcher polls the owned process independently of agent requests, atomically downloads
+matching artifacts as soon as
+the process exits, retries interrupted exports with backoff, and resumes from the process journal
+after MCP restart. Automatic export never releases the runtime. Inspect `auto_export` in process
+status/list results for `watching`, `degraded`, `completed`, or `held` and per-rule outcomes.
+
+```json
+{
+  "argv": ["python", "job.py"],
+  "session": "compute",
+  "export_on_exit": [
+    {
+      "remote_path": "/content/result.tar.gz",
+      "local_path": "./artifacts/result.tar.gz",
+      "exit_codes": [0],
+      "overwrite": false
+    },
+    {
+      "remote_path": "/content/failure.log",
+      "local_path": "./artifacts/failure.log",
+      "exit_codes": null,
+      "overwrite": true
+    }
+  ]
+}
+```
+
+All public MCP input properties carry schema descriptions. Optional fields state their default,
+units, bounds, selection behavior, or destructive effect directly in `tools/list`; agents should
+treat that generated schema as authoritative rather than guessing from parameter names.
 Every command is runtime-owned and receives a `process_id`. The timeout is only how long the MCP
 call waits: if it expires, `process_continues=true` and the command remains alive for later
 status/output/signal calls. Termination is always explicit. Python/Jupyter output is bounded to
