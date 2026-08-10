@@ -12,7 +12,9 @@ from types import SimpleNamespace
 import pytest
 
 from src.cli import (
+    _client_executable,
     _client_has_server,
+    _ensure_codex_timeouts,
     claude_desktop_config_path,
     config_json,
     install_claude_desktop,
@@ -130,6 +132,43 @@ def test_codex_registration_command_is_portable(tmp_path: Path):
     command = install_command("codex", "codex", "uv", tmp_path, "colab")
     assert command[:4] == ["codex", "mcp", "add", "colab"]
     assert command[-6:] == ["--directory", str(tmp_path), "run", "--locked", "colab-mcp", "serve"]
+
+
+def test_windows_codex_prefers_launchable_app_cli_over_windowsapps_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    cli = tmp_path / "OpenAI" / "Codex" / "bin" / "build" / "codex.exe"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"")
+    monkeypatch.setattr(
+        "src.cli.shutil.which", lambda _name: r"C:\Program Files\WindowsApps\Codex\codex.exe"
+    )
+
+    assert _client_executable("codex", system="Windows", localappdata=str(tmp_path)) == str(cli)
+
+
+def test_windows_codex_honors_explicit_cli_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    cli = tmp_path / "codex.exe"
+    cli.write_bytes(b"")
+    monkeypatch.setenv("CODEX_CLI_PATH", str(cli))
+
+    assert _client_executable("codex", system="Windows", localappdata=str(tmp_path)) == str(cli)
+
+
+def test_codex_timeout_setup_preserves_config_and_is_idempotent(tmp_path: Path):
+    config = tmp_path / "config.toml"
+    config.write_text(
+        '[mcp_servers.colab]\ncommand = "uv"\n\n[mcp_servers.other]\ncommand = "other"\n',
+        encoding="utf-8",
+    )
+
+    _ensure_codex_timeouts("colab", config)
+    _ensure_codex_timeouts("colab", config)
+
+    text = config.read_text(encoding="utf-8")
+    assert text.count("startup_timeout_sec = 30") == 1
+    assert text.count("tool_timeout_sec = 21600") == 1
+    assert '[mcp_servers.other]\ncommand = "other"' in text
 
 
 def test_claude_registration_uses_user_scoped_stdio(tmp_path: Path):

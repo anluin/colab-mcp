@@ -14,6 +14,9 @@ account and authenticate again.
 Run `uv run colab-mcp install codex --force` (or `grok`, `claude`, `claude-desktop`) and restart that
 client. Confirm `uv` and the repository path still exist. `uv run --locked colab-mcp serve` should
 remain silent while it waits for MCP messages; ordinary stdout logging would corrupt stdio framing.
+On Windows, the installer prefers Codex's launchable per-user CLI over the protected Windows Store
+application binary. `colab-mcp doctor` reports the selected path; set `CODEX_CLI_PATH` explicitly
+only when the automatic per-user CLI discovery cannot find it.
 
 For Grok, also run `grok mcp doctor colab`. On Windows, if doctor reports a failed handshake with a
 locked `colab-mcp.exe` under the project `.venv`, reinstall with

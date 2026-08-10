@@ -6,6 +6,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -191,6 +192,52 @@ def _uv() -> str:
     return executable
 
 
+def _client_executable(
+    client: str,
+    *,
+    system: str | None = None,
+    localappdata: str | None = None,
+) -> str | None:
+    """Resolve a launchable client CLI, including the Codex Store-app shim on Windows."""
+    system = system or platform.system()
+    if client == "codex" and system == "Windows":
+        configured = os.environ.get("CODEX_CLI_PATH")
+        if configured and Path(configured).is_file():
+            return configured
+        local_value = localappdata or os.environ.get("LOCALAPPDATA")
+        if local_value:
+            candidates = list((Path(local_value) / "OpenAI" / "Codex" / "bin").glob("*/codex.exe"))
+            if candidates:
+                return str(max(candidates, key=lambda path: path.stat().st_mtime))
+    return shutil.which(client)
+
+
+def _ensure_codex_timeouts(name: str, config_path: Path | None = None) -> None:
+    """Keep startup and long Colab operations above Codex's short defaults."""
+    path = config_path or Path.home() / ".codex" / "config.toml"
+    if not path.is_file():
+        return
+    text = path.read_text(encoding="utf-8")
+    header = f"[mcp_servers.{name}]"
+    start = text.find(header)
+    if start < 0:
+        return
+    end = text.find("\n[", start + len(header))
+    end = len(text) if end < 0 else end
+    section = text[start:end]
+    settings = {"startup_timeout_sec": "30", "tool_timeout_sec": "21600"}
+    for key, value in settings.items():
+        pattern = rf"(?m)^{re.escape(key)}\s*=.*$"
+        if re.search(pattern, section):
+            section = re.sub(pattern, f"{key} = {value}", section)
+        else:
+            section = section.rstrip() + f"\n{key} = {value}\n"
+    updated = text[:start] + section + text[end:]
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(updated, encoding="utf-8")
+    temporary.replace(path)
+
+
 def install(client: str, name: str, force: bool) -> None:
     if client == "claude-desktop":
         install_claude_desktop(name, force)
@@ -200,7 +247,7 @@ def install(client: str, name: str, force: bool) -> None:
     if client == "json":
         print(config_json(uv, project, name))
         return
-    executable = shutil.which(client)
+    executable = _client_executable(client)
     if not executable:
         raise SystemExit(f"{client!r} was not found on PATH")
     if _client_has_server(executable, client, name):
@@ -209,6 +256,8 @@ def install(client: str, name: str, force: bool) -> None:
             return
         _run([executable, "mcp", "remove", name])
     _run(install_command(client, executable, uv, project, name))
+    if client == "codex":
+        _ensure_codex_timeouts(name)
     restart_hint = {
         "grok": "Restart Grok, open /mcps, and call colab_health.",
         "codex": "Restart the client, then run /mcp.",
@@ -222,7 +271,7 @@ def doctor(live: bool = False) -> None:
     report: dict[str, Any] = {
         "oauth_token_present": manager.authenticated,
         "uv": shutil.which("uv"),
-        "codex": shutil.which("codex"),
+        "codex": _client_executable("codex"),
         "claude": shutil.which("claude"),
         "grok": shutil.which("grok"),
         "server_command": server_command(_uv(), _project()),
