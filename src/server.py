@@ -578,7 +578,7 @@ async def colab_transfer_download(
     compression_min_savings: CompressionMinSavings = 0.10,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Download atomically. On interruption retry with sync=true on the same incarnation; verify hashes."""
+    """Download atomically. Pre-submission connection failures retry once with the same still-valid lease/fingerprint; other interruptions require sync=true retry and hash verification."""
     return await manager.transfer_download(
         remote_path,
         local_path,

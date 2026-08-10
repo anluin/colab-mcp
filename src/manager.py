@@ -1005,89 +1005,114 @@ class ColabManager:
 
         overall_started = time.monotonic()
 
-        def run() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        def connect(connection_abandoned: threading.Event) -> tuple[Any, dict[str, Any]]:
             # Use the Colab-specialized client directly. This avoids the CLI's
             # legacy KernelClient feature-detection path, which is unreliable
             # during circular package initialization on Windows.
-            kernel = None
             connection_started = time.monotonic()
             attempt_timings: dict[str, Any] = {}
             try:
-                try:
-                    kernel = kernel_client(
-                        connection_timeout=connection_timeout,
-                        server_url=session.url,
-                        proxy_token=session.token,
-                        kernel_id=session.kernel_id,
-                        client_kwargs={
-                            "extra_params": {"colab-runtime-proxy-token": session.token}
-                        },
-                    )
-                    kernel.start(timeout=connection_timeout)
-                    attempt_timings["kernel_connection_seconds"] = round(
-                        time.monotonic() - connection_started, 3
-                    )
-                    if not session.kernel_id and kernel.id:
-                        session.kernel_id = kernel.id
-                        self.store.add(session)
-                    preflight_started = time.monotonic()
-                    kernel.execute(
-                        "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
-                        timeout=connection_timeout,
-                    )
-                    attempt_timings["kernel_preflight_seconds"] = round(
-                        time.monotonic() - preflight_started, 3
-                    )
-                except Exception as error:
-                    raise KernelConnectionError(
-                        "Kernel connection failed before the requested operation was sent",
-                        {
-                            "kernel_connection_seconds": round(
-                                time.monotonic() - connection_started, 3
-                            ),
-                            "connection_timeout_seconds": connection_timeout,
-                        },
-                    ) from error
-                request_started = time.monotonic()
-                try:
-                    reply = kernel.execute(code, timeout=timeout)
-                except TimeoutError as error:
-                    raise RequestOutcomeUnknownError(
-                        "operation_timed_out_submission_outcome_unknown",
-                        "The kernel adapter timed out after its execute call began.",
-                        {
-                            "phase": "request_submission_to_output_retrieval",
-                            "request_submission": "outcome_unknown",
-                            "elapsed_seconds": round(time.monotonic() - request_started, 3),
-                            "timeout_seconds": timeout,
-                        },
-                    ) from error
-                except OSError as error:
-                    raise RequestOutcomeUnknownError(
-                        "request_submission_outcome_unknown_response_lost",
-                        "The kernel channel failed after its execute call began.",
-                        {
-                            "phase": "request_submission_to_output_retrieval",
-                            "request_submission": "outcome_unknown",
-                            "elapsed_seconds": round(time.monotonic() - request_started, 3),
-                        },
-                    ) from error
-                attempt_timings["request_submission_to_output_retrieval_seconds"] = round(
-                    time.monotonic() - request_started, 3
+                kernel = kernel_client(
+                    connection_timeout=connection_timeout,
+                    server_url=session.url,
+                    proxy_token=session.token,
+                    kernel_id=session.kernel_id,
+                    client_kwargs={"extra_params": {"colab-runtime-proxy-token": session.token}},
                 )
-                attempt_timings["request_submission_confirmed"] = reply is not None
-                return (reply.get("outputs", []) if reply else []), attempt_timings
-            finally:
-                if kernel is not None:
+                kernel.start(timeout=connection_timeout)
+                attempt_timings["kernel_connection_seconds"] = round(
+                    time.monotonic() - connection_started, 3
+                )
+                if not session.kernel_id and kernel.id:
+                    session.kernel_id = kernel.id
+                    self.store.add(session)
+                preflight_started = time.monotonic()
+                kernel.execute(
+                    "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
+                    timeout=connection_timeout,
+                )
+                if connection_abandoned.is_set():
                     with contextlib.suppress(Exception):
                         kernel.stop(shutdown_kernel=False)
+                    raise TimeoutError("connection completed after local deadline")
+                attempt_timings["kernel_preflight_seconds"] = round(
+                    time.monotonic() - preflight_started, 3
+                )
+                return kernel, attempt_timings
+            except Exception as error:
+                raise KernelConnectionError(
+                    "Kernel connection failed before the requested operation was sent",
+                    {
+                        "kernel_connection_seconds": round(
+                            time.monotonic() - connection_started, 3
+                        ),
+                        "connection_timeout_seconds": connection_timeout,
+                    },
+                ) from error
+
+        def submit(
+            kernel: Any, attempt_timings: dict[str, Any]
+        ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+            request_started = time.monotonic()
+            try:
+                reply = kernel.execute(code, timeout=timeout)
+            except TimeoutError as error:
+                raise RequestOutcomeUnknownError(
+                    "operation_timed_out_submission_outcome_unknown",
+                    "The kernel adapter timed out after its execute call began.",
+                    {
+                        "phase": "request_submission_to_output_retrieval",
+                        "request_submission": "outcome_unknown",
+                        "elapsed_seconds": round(time.monotonic() - request_started, 3),
+                        "timeout_seconds": timeout,
+                    },
+                ) from error
+            except OSError as error:
+                raise RequestOutcomeUnknownError(
+                    "request_submission_outcome_unknown_response_lost",
+                    "The kernel channel failed after its execute call began.",
+                    {
+                        "phase": "request_submission_to_output_retrieval",
+                        "request_submission": "outcome_unknown",
+                        "elapsed_seconds": round(time.monotonic() - request_started, 3),
+                    },
+                ) from error
+            finally:
+                with contextlib.suppress(Exception):
+                    kernel.stop(shutdown_kernel=False)
+            attempt_timings["request_submission_to_output_retrieval_seconds"] = round(
+                time.monotonic() - request_started, 3
+            )
+            attempt_timings["request_submission_confirmed"] = reply is not None
+            return (reply.get("outputs", []) if reply else []), attempt_timings
 
         if connection_attempts not in {1, 2}:
             raise ValueError("connection_attempts must be 1 or 2")
         attempts: list[dict[str, Any]] = []
         for attempt in range(connection_attempts):
+            connection_abandoned = threading.Event()
             try:
-                raw_outputs, attempt_timing = await asyncio.to_thread(run)
+                # Upstream connection setup spans HTTP model lookup, websocket startup,
+                # and a preflight request. Some layers ignore their nominal timeout, so
+                # enforce one bounded deadline around the complete pre-submission phase.
+                try:
+                    kernel, attempt_timing = await asyncio.wait_for(
+                        asyncio.to_thread(connect, connection_abandoned),
+                        timeout=connection_timeout + 1,
+                    )
+                except TimeoutError as error:
+                    connection_abandoned.set()
+                    raise KernelConnectionError(
+                        "Kernel connection exceeded the bounded local deadline before submission",
+                        {
+                            "kernel_connection_seconds": round(connection_timeout + 1, 3),
+                            "connection_timeout_seconds": connection_timeout,
+                            "local_deadline_seconds": connection_timeout + 1,
+                        },
+                    ) from error
+                raw_outputs, attempt_timing = await asyncio.to_thread(
+                    submit, kernel, attempt_timing
+                )
                 attempts.append({"attempt": attempt + 1, **attempt_timing})
                 output_started = time.monotonic()
                 outputs = _bound_outputs(_json_safe(raw_outputs), output_limit)
@@ -1224,7 +1249,7 @@ class ColabManager:
                     )
                 else:
                     outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-            except (TimeoutError, OSError, RequestOutcomeUnknownError):
+            except (KernelConnectionError, TimeoutError, OSError):
                 retryable = {
                     "process_status",
                     "process_list",
@@ -1242,6 +1267,11 @@ class ColabManager:
                     operation,
                     name,
                 )
+                # A pre-submission failure must not consume or replace the lease. Recheck
+                # local token validity and assignment ownership, while retaining the exact
+                # token. The retried remote request atomically verifies its fingerprint.
+                if lease_token:
+                    await self._operation_lease(session.name, lease_token)
                 if lease_token:
                     outputs = await self.execute(
                         code,

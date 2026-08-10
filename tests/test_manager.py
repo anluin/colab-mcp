@@ -794,6 +794,104 @@ def test_kernel_connection_retry_never_clears_owned_incarnation_kernel_id(
     assert instance.store.get("runtime").kernel_id == "owned-kernel"
 
 
+def test_lease_bound_download_retries_pre_submission_failure_without_replacing_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    attempts = 0
+    lease_checks = []
+
+    async def execute(*_args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs["connection_timeout"] == 5
+        assert kwargs["connection_attempts"] == 1
+        if attempts == 1:
+            raise KernelConnectionError("proxy unavailable before send")
+        return [
+            {
+                "output_type": "stream",
+                "text": '__COLAB_MCP_RESULT__{"ok":true,"result":{"ok":true}}\n',
+            }
+        ]
+
+    async def preserve_lease(name, token):
+        lease_checks.append((name, token))
+        return runtime, {"lease_token": token, "runtime_fingerprint": "a" * 32}
+
+    instance.execute = execute
+    instance._operation_lease = preserve_lease
+    result = asyncio.run(
+        instance._remote_operation(
+            "fs_read",
+            {"path": "/content/file", "offset": 0, "limit": 3},
+            "runtime",
+            lease_token="b" * 32,
+        )
+    )
+
+    assert result == {"ok": True}
+    assert attempts == 2
+    assert lease_checks == [("runtime", "b" * 32)]
+    assert instance.store.get("runtime").operation_lease_token == "b" * 32
+
+
+def test_lease_bound_read_does_not_retry_unknown_submission_outcome(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    attempts = 0
+
+    async def execute(*_args, **_kwargs):
+        nonlocal attempts
+        attempts += 1
+        raise RequestOutcomeUnknownError(
+            "request_submission_outcome_unknown_response_lost",
+            "response lost",
+            {"request_submission": "outcome_unknown"},
+        )
+
+    instance.execute = execute
+    with pytest.raises(RequestOutcomeUnknownError):
+        asyncio.run(instance._remote_operation("fs_read", {}, "runtime"))
+    assert attempts == 1
+
+
+def test_connection_setup_has_hard_local_deadline(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    def blocked_kernel_client(**_kwargs):
+        time.sleep(0.2)
+        raise OSError("late failure")
+
+    real_wait_for = asyncio.wait_for
+
+    async def shortened_wait_for(awaitable, timeout):
+        assert timeout == 6
+        return await real_wait_for(awaitable, timeout=0.02)
+
+    monkeypatch.setattr("src.manager.kernel_client", blocked_kernel_client)
+    monkeypatch.setattr("src.manager.asyncio.wait_for", shortened_wait_for)
+    with pytest.raises(KernelConnectionError) as caught:
+        asyncio.run(
+            instance.execute(
+                "print('never sent')",
+                "runtime",
+                1,
+                connection_timeout=5,
+                connection_attempts=1,
+            )
+        )
+    assert caught.value.details["request_submission"] == "not_submitted"
+    assert caught.value.details["local_deadline_seconds"] == 6
+
+
 def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     instance = manager(tmp_path, monkeypatch)
     source = tmp_path / "source.bin"

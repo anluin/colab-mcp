@@ -112,3 +112,13 @@ Every MCP tool description includes the recovery action for failures specific to
 operation. The server-level instructions define the common error-code playbook. MCP
 clients should expose both descriptions to the agent; if a client hides server
 instructions, the tool descriptions remain sufficient for the immediate next action.
+# Lease-bound download cannot connect
+
+`colab_transfer_download` automatically retries one
+`kernel_connection_failed_request_not_submitted` failure after confirming that the same
+assignment and lease are still owned. Connection setup has a six-second local wall-clock
+deadline for the configured five-second upstream timeout. The lease is not invalidated by
+this safe pre-submission failure. If both attempts fail, keep the lease token and retry the
+download while it remains unexpired; call `colab_allocation_probe` again only after expiry.
+The remote fingerprint guard still runs inside the first successfully submitted request, so
+the retry never follows a recycled backend.
