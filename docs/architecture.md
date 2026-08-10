@@ -51,6 +51,17 @@ have been sent, only idempotent operations are eligible for retry.
 Transfers begin with repeated upstream assignment observations, keep-alive refreshes, and a remote
 incarnation check. Individual filesystem calls retain their own incarnation guard, so stabilization
 does not weaken fail-fast runtime replacement detection during a transfer.
+The probe also publishes a random operation lease into that incarnation and persists only the
+current token locally. Critical tools accept the opaque token. The generated remote request checks
+the incarnation and lease before entering its operation branch; this closes the probe-to-mutation
+gap without pretending that the Colab assignment itself can be locked. An assignment control-plane
+check is bounded to five seconds before critical work.
+
+Upload chunks use offset-checked, fsynced staging writes. The transfer ID deterministically names
+each staging file, and retry verifies the complete staged prefix checksum before seeking the local
+wire representation. A duplicate chunk is accepted only when its bytes match. Per-transfer
+heartbeats run independently of MCP reasoning time, and every chunk revalidates the remote lease.
+Failures preserve staging and return recovery metadata; publication or explicit cleanup removes it.
 Wire compression is a transport concern inside those transfer primitives. Each eligible file is
 gzip-compressed into a unique staging object, transferred in bounded chunks, and decompressed into
 a second staging object before atomic publication. Both wire bytes and original content are

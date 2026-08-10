@@ -26,6 +26,11 @@ runtimes are ephemeral execution environments.
 - Overwrite, append, recursive deletion, stale-record removal, and orphan release are explicit.
 - Transfers verify the owned allocation lease before remote access. Process export holds the
   runtime on every failure, and release after export requires `release_on_success=true`.
+- Operation leases are opaque, expire after one hour, are bound to one persisted session and remote
+  incarnation, and are checked inside the same remote request before critical mutation. Only the
+  newest probe token is accepted. Tokens are excluded from session-list/start responses.
+- Resumable upload chunks require exact offsets and matching bytes. Failed staging is never
+  published and is removable only through constrained staging cleanup or explicit filesystem tools.
 - Compressed transfers enforce declared original sizes, total transfer limits, exact decompressed
   lengths, and SHA-256 checks before publication; malformed or expanding gzip data is discarded.
 - Auto-export destinations are explicit host paths persisted in owner-only process state. Rules are

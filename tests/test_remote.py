@@ -142,6 +142,24 @@ def test_remote_operations_verify_incarnation_before_process_or_filesystem_state
     )
 
 
+def test_operation_lease_is_validated_inside_same_remote_request_before_chunk_mutation():
+    code = build_remote_code(
+        "transfer_upload_chunk",
+        {
+            "path": "/content/file.colab-mcp-wire-test",
+            "offset": 0,
+            "data_base64": "",
+            "runtime_fingerprint": "a" * 32,
+            "operation_lease_token": "b" * 32,
+        },
+    )
+    assert code.index("operation_lease_stale") < code.index(
+        "elif _cm_operation == 'transfer_upload_chunk'"
+    )
+    assert "transfer_offset_conflict" in code
+    assert "already_applied" in code
+
+
 @pytest.mark.parametrize("argv", [[], [""], [1]])
 def test_invalid_argv_is_rejected(argv):
     with pytest.raises(ValueError, match="argv"):
@@ -340,7 +358,14 @@ def test_process_operations_cross_request_boundaries(tmp_path, monkeypatch):
     )
     operations = []
 
-    async def fake_remote(operation, payload, name, timeout=120):
+    async def stable_lease(name, _token=None):
+        return instance.resolve(name), {
+            "status": "stable",
+            "lease_token": "b" * 32,
+            "assignment_lookup_seconds": 0.001,
+        }
+
+    async def fake_remote(operation, payload, name, timeout=120, **_kwargs):
         operations.append((operation, payload, name, timeout))
         if operation == "process_output":
             return {
@@ -358,6 +383,7 @@ def test_process_operations_cross_request_boundaries(tmp_path, monkeypatch):
         }
 
     instance._remote_operation = fake_remote
+    instance._operation_lease = stable_lease
     started = asyncio.run(instance.process_start(["sleep", "10"], "runtime"))
     asyncio.run(instance.process_status("abc", "runtime"))
     asyncio.run(instance.process_output("abc", "runtime", offset=4, limit=10))
@@ -578,7 +604,9 @@ def test_replaced_runtime_returns_last_process_metadata_and_then_fails_fast(tmp_
     assert first["last_known_process"]["argv"] == ["python", "job.py"]
     assert first["last_known_process"]["cwd"] == "/content/project"
     assert first["diagnostic"]["code"] == "runtime_replaced"
-    assert first["diagnostic"]["probable_cause"] == "colab_runtime_recycle_or_runtime_oom"
+    assert first["diagnostic"]["probable_cause"] == (
+        "runtime_incarnation_changed; process OOM is not inferred"
+    )
     recovered = instance.store.get("runtime")
     assert recovered.runtime_replaced_at is not None
 
@@ -610,7 +638,9 @@ def test_file_operations_fail_fast_after_first_fingerprint_mismatch(tmp_path, mo
         asyncio.run(instance.filesystem_stat("/content/file", "runtime"))
 
     assert len(calls) == 1
-    assert second.value.details["probable_cause"] == "colab_runtime_recycle_or_runtime_oom"
+    assert second.value.details["probable_cause"] == (
+        "endpoint_now_points_to_a_different_runtime_incarnation"
+    )
 
 
 def test_unknown_remote_process_returns_journaled_metadata_and_diagnostic(tmp_path, monkeypatch):
@@ -638,4 +668,6 @@ def test_unknown_remote_process_returns_journaled_metadata_and_diagnostic(tmp_pa
     assert result["status"] == "lost"
     assert result["last_known_process"]["pid"] == 9
     assert result["diagnostic"]["code"] == "process_state_lost"
-    assert result["diagnostic"]["probable_cause"] == "remote_process_state_lost_or_runtime_oom"
+    assert result["diagnostic"]["probable_cause"] == (
+        "process_state_missing; inspect runtime memory and system logs for OOM evidence"
+    )

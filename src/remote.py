@@ -183,6 +183,7 @@ _cm_payload = _cm_json.loads(_cm_base64.b64decode({encoded!r}).decode())
 _cm_root = _cm_pathlib.Path('/content').resolve()
 _cm_state_root = _cm_root / '.colab-mcp'
 _cm_incarnation_path = _cm_state_root / 'runtime-incarnation'
+_cm_operation_lease_path = _cm_state_root / 'operation-lease.json'
 _cm_process_root = _cm_state_root / 'processes'
 
 def _cm_path(value):
@@ -247,15 +248,76 @@ try:
                 'runtime_replaced: expected incarnation ' + str(_cm_expected_fingerprint)
                 + ', observed ' + _cm_actual_label
                 + '; Colab recycled the backend, so start a new session')
+        _cm_operation_lease_token = _cm_payload.get('operation_lease_token')
+        if _cm_operation_lease_token is not None:
+            if not _cm_operation_lease_path.is_file():
+                raise RuntimeError('operation_lease_missing: probe again before retrying')
+            _cm_operation_lease = _cm_json.loads(
+                _cm_operation_lease_path.read_text(encoding='utf-8'))
+            if (_cm_operation_lease.get('token') != _cm_operation_lease_token
+                    or _cm_operation_lease.get('runtime_fingerprint') != _cm_actual_fingerprint):
+                raise RuntimeError('operation_lease_stale: lease does not own this incarnation')
+            _cm_lease_expiry = _cm_datetime.datetime.fromisoformat(
+                _cm_operation_lease['expires_at'])
+            if _cm_lease_expiry <= _cm_datetime.datetime.now(_cm_datetime.timezone.utc):
+                raise RuntimeError('operation_lease_expired: probe again before retrying')
         _cm_process_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     if _cm_operation == 'incarnation_init':
         pass
     elif _cm_operation == 'lease_probe':
+        _cm_issued_token = _cm_payload.get('issue_lease_token')
+        _cm_expires_at = _cm_payload.get('lease_expires_at')
+        if (not isinstance(_cm_issued_token, str) or len(_cm_issued_token) != 32
+                or not all(char in '0123456789abcdef' for char in _cm_issued_token)):
+            raise ValueError('issue_lease_token must be 32 hexadecimal characters')
+        _cm_operation_lease_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _cm_lease_temporary = _cm_operation_lease_path.with_suffix('.tmp')
+        _cm_lease_temporary.write_text(_cm_json.dumps({{
+            'token': _cm_issued_token,
+            'runtime_fingerprint': _cm_actual_fingerprint,
+            'expires_at': _cm_expires_at,
+        }}), encoding='utf-8')
+        _cm_lease_temporary.replace(_cm_operation_lease_path)
         _cm_result = {{
             'status': 'stable',
             'runtime_fingerprint': _cm_actual_fingerprint,
             'observed_at': _cm_datetime.datetime.now(_cm_datetime.timezone.utc).isoformat(),
+            'lease_expires_at': _cm_expires_at,
         }}
+    elif _cm_operation == 'transfer_upload_chunk':
+        _cm_target = _cm_path(_cm_payload['path'])
+        _cm_offset = int(_cm_payload['offset'])
+        _cm_data = _cm_base64.b64decode(_cm_payload['data_base64'], validate=True)
+        if _cm_offset < 0 or len(_cm_data) > 1000000:
+            raise ValueError('invalid transfer chunk bounds')
+        _cm_target.parent.mkdir(parents=True, exist_ok=True)
+        _cm_current_size = _cm_target.stat().st_size if _cm_target.is_file() else 0
+        _cm_chunk_digest = _cm_hashlib.sha256(_cm_data).hexdigest()
+        if _cm_current_size == _cm_offset + len(_cm_data):
+            with _cm_target.open('rb') as _cm_handle:
+                _cm_handle.seek(_cm_offset)
+                _cm_existing = _cm_handle.read(len(_cm_data))
+            if _cm_hashlib.sha256(_cm_existing).hexdigest() != _cm_chunk_digest:
+                raise RuntimeError('transfer_resume_conflict: staged chunk differs')
+            _cm_result = {{
+                'path': str(_cm_target), 'offset': _cm_current_size,
+                'chunk_bytes': len(_cm_data), 'chunk_sha256': _cm_chunk_digest,
+                'already_applied': True,
+            }}
+        elif _cm_current_size != _cm_offset:
+            raise RuntimeError(
+                'transfer_offset_conflict: expected ' + str(_cm_offset)
+                + ', staged file has ' + str(_cm_current_size) + ' bytes')
+        else:
+            with _cm_target.open('ab') as _cm_handle:
+                _cm_handle.write(_cm_data)
+                _cm_handle.flush()
+                _cm_os.fsync(_cm_handle.fileno())
+            _cm_result = {{
+                'path': str(_cm_target), 'offset': _cm_offset + len(_cm_data),
+                'chunk_bytes': len(_cm_data), 'chunk_sha256': _cm_chunk_digest,
+                'already_applied': False,
+            }}
     elif _cm_operation == 'process_start':
         _cm_cwd = _cm_path(_cm_payload.get('cwd'))
         if not _cm_cwd.is_dir():

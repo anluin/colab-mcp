@@ -69,6 +69,17 @@ possible.
 window; reconcile the session before retrying. `runtime_replaced` means the endpoint no longer
 contains the expected runtime incarnation. Neither condition starts a partial transfer.
 
+`operation_lease_stale` or `operation_lease_expired` means another probe superseded the token or
+its one-hour lifetime ended. Probe again. `assignment_no_longer_exists` is distinct from a
+replacement fingerprint; `assignment_lookup_timed_out` means the Colab control plane did not answer
+within five seconds and no critical request was submitted.
+
+For `transfer_failed_staging_preserved`, inspect `request_submission`, `staged_bytes`, and
+`staging_path`. Retry the unchanged source/destination with the returned `transfer_id` only while
+the same runtime fingerprint is alive. Use `colab_transfer_cleanup` when the partial is no longer
+wanted. A resume conflict is not retried automatically because it indicates different local bytes
+or an unexpected remote staging mutation.
+
 If `colab_process_export` returns `disposition="held"`, the runtime remains tracked. Correct the
 reported status, destination, transfer, or release error and retry. A successfully published local
 artifact is retained even when the subsequent explicit release fails.

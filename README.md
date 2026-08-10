@@ -230,10 +230,19 @@ already-compressed or high-entropy files therefore stay uncompressed in `auto` m
 The shorter `colab_upload` and `colab_download` names are compatibility aliases for the same bounded,
 verified implementation; they do not bypass its limits.
 
-Every transfer first performs a bounded allocation lease probe: it observes the owned endpoint
-twice, refreshes its lease, and verifies the runtime-incarnation marker before reading or mutating
-remote files. A missing assignment fails as `allocation_lease_lost`; a recycled backend continues
-to fail as `runtime_replaced`.
+`colab_allocation_probe` returns an opaque, one-hour `lease_token` bound to the tracked endpoint and
+runtime fingerprint both locally and inside that runtime. Pass it to a transfer or process start to
+avoid a new probe. Critical remote requests validate the token and fingerprint in the same Python
+request before mutation, so the operation cannot follow a replacement runtime. Omitting the token
+performs a fresh probe. Assignment lookup is bounded to five seconds and reports
+`assignment_no_longer_exists` or `assignment_lookup_timed_out` separately.
+
+Uploads emit MCP progress after every durable chunk with phase, bytes, total, chunk number, and
+elapsed time. A failed upload reports its `transfer_id`, deterministic `staging_path`, known staged
+offset, submission state, and whether same-incarnation resume is safe. Retry with the same
+`transfer_id`; the server verifies the staged prefix before continuing. Successful publication
+removes staging. Failed staging is retained for resume and can be explicitly removed with
+`colab_transfer_cleanup`.
 
 After an owned process exits, `colab_process_export` downloads one file or directory into a hidden
 sibling staging path and publishes it locally with one filesystem rename. Any status, lease,

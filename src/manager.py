@@ -15,6 +15,7 @@ import threading
 import time
 import uuid
 import zlib
+from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
@@ -130,6 +131,39 @@ class AutoExportRule(BaseModel):
 class KernelConnectionError(RuntimeError):
     """The runtime operation was not sent because kernel connection setup failed."""
 
+    code = "kernel_connection_failed_request_not_submitted"
+
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        self.details = {
+            "code": self.code,
+            "phase": "kernel_connection",
+            "request_submission": "not_submitted",
+            "message": message,
+            **(details or {}),
+        }
+        super().__init__(self.code + ": " + json.dumps(self.details, separators=(",", ":")))
+
+
+class OperationLeaseError(RuntimeError):
+    """An operation-bound lease is absent, stale, expired, or no longer assigned."""
+
+    def __init__(self, code: str, message: str, details: dict[str, Any] | None = None) -> None:
+        self.code = code
+        self.details = {"code": code, "message": message, **(details or {})}
+        super().__init__(code + ": " + json.dumps(self.details, separators=(",", ":")))
+
+
+class TransferError(RuntimeError):
+    """A resumable transfer failed with explicit staging and submission state."""
+
+    def __init__(self, code: str, message: str, details: dict[str, Any]) -> None:
+        self.code = code
+        self.details = {"code": code, "message": message, **details}
+        super().__init__(code + ": " + json.dumps(self.details, separators=(",", ":")))
+
+
+ProgressCallback = Callable[[dict[str, Any]], Awaitable[None]]
+
 
 class ManagedSessionState(SessionState):
     """Persisted assignment ownership plus this backend incarnation's marker."""
@@ -141,6 +175,9 @@ class ManagedSessionState(SessionState):
     last_keepalive_at: str | None = None
     last_keepalive_error: str | None = None
     consecutive_keepalive_failures: int = 0
+    operation_lease_token: str | None = None
+    operation_lease_issued_at: str | None = None
+    operation_lease_expires_at: str | None = None
 
 
 def _secure_permissions(path: Path, mode: int, platform: str = os.name) -> None:
@@ -844,7 +881,12 @@ class ColabManager:
             active = session.endpoint in remote_endpoints
             if active:
                 self.ensure_keepalive(session)
-            result.append({**session.model_dump(exclude={"token"}), "active": active})
+            result.append(
+                {
+                    **session.model_dump(exclude={"token", "operation_lease_token"}),
+                    "active": active,
+                }
+            )
         return result
 
     async def reconcile(
@@ -897,7 +939,13 @@ class ColabManager:
         return result
 
     async def execute(
-        self, code: str, name: str | None, timeout: float, output_limit: int = 100_000
+        self,
+        code: str,
+        name: str | None,
+        timeout: float,
+        output_limit: int = 100_000,
+        connection_timeout: float = 60,
+        connection_attempts: int = 2,
     ) -> list[dict[str, Any]]:
         if not 1 <= output_limit <= 3_000_000:
             raise ValueError("output_limit must be between 1 and 3000000")
@@ -909,6 +957,7 @@ class ColabManager:
             # legacy KernelClient feature-detection path, which is unreliable
             # during circular package initialization on Windows.
             kernel = None
+            connection_started = time.monotonic()
             try:
                 try:
                     kernel = jupyter_kernel_client.ColabKernelClient(
@@ -919,17 +968,23 @@ class ColabManager:
                             "extra_params": {"colab-runtime-proxy-token": session.token}
                         },
                     )
-                    kernel.start(timeout=60)
+                    kernel.start(timeout=connection_timeout)
                     if not session.kernel_id and kernel.id:
                         session.kernel_id = kernel.id
                         self.store.add(session)
                     kernel.execute(
                         "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
-                        timeout=60,
+                        timeout=connection_timeout,
                     )
                 except Exception as error:
                     raise KernelConnectionError(
-                        "Kernel connection failed before the requested operation was sent"
+                        "Kernel connection failed before the requested operation was sent",
+                        {
+                            "kernel_connection_seconds": round(
+                                time.monotonic() - connection_started, 3
+                            ),
+                            "connection_timeout_seconds": connection_timeout,
+                        },
                     ) from error
                 reply = kernel.execute(code, timeout=timeout)
                 return reply.get("outputs", []) if reply else []
@@ -938,12 +993,15 @@ class ColabManager:
                     with contextlib.suppress(Exception):
                         kernel.stop(shutdown_kernel=False)
 
-        for attempt in range(2):
+        if connection_attempts not in {1, 2}:
+            raise ValueError("connection_attempts must be 1 or 2")
+        for attempt in range(connection_attempts):
             try:
                 raw_outputs = await asyncio.to_thread(run)
                 return _bound_outputs(_json_safe(raw_outputs), output_limit)
-            except KernelConnectionError:
-                if attempt:
+            except KernelConnectionError as error:
+                if attempt + 1 >= connection_attempts:
+                    error.details["retries"] = attempt
                     raise
                 session.kernel_id = None
                 self.store.add(session)
@@ -966,7 +1024,12 @@ class ColabManager:
         return await self.execute(code, name, timeout, output_limit)
 
     async def _remote_operation(
-        self, operation: str, payload: dict[str, Any], name: str | None, timeout: float = 120
+        self,
+        operation: str,
+        payload: dict[str, Any],
+        name: str | None,
+        timeout: float = 120,
+        lease_token: str | None = None,
     ) -> Any:
         session = self.resolve(name)
         fingerprint = getattr(session, "runtime_fingerprint", None)
@@ -982,11 +1045,27 @@ class ColabManager:
                 session.runtime_replaced_reason or "runtime fingerprint previously changed",
                 payload.get("process_id"),
             )
-        payload = {**payload, "runtime_fingerprint": fingerprint}
+        if lease_token is not None:
+            self._validate_operation_lease(session, lease_token)
+        payload = {
+            **payload,
+            "runtime_fingerprint": fingerprint,
+            **({"operation_lease_token": lease_token} if lease_token else {}),
+        }
         code = build_remote_code(operation, payload)
         try:
             try:
-                outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
+                if lease_token:
+                    outputs = await self.execute(
+                        code,
+                        name,
+                        timeout,
+                        output_limit=3_000_000,
+                        connection_timeout=5,
+                        connection_attempts=1,
+                    )
+                else:
+                    outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
             except (TimeoutError, OSError):
                 retryable = {
                     "process_status",
@@ -1003,7 +1082,17 @@ class ColabManager:
                 session.kernel_id = None
                 self.store.add(session)
                 logger.warning("kernel_reconnect_retry operation=%s session=%s", operation, name)
-                outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
+                if lease_token:
+                    outputs = await self.execute(
+                        code,
+                        name,
+                        timeout,
+                        output_limit=3_000_000,
+                        connection_timeout=5,
+                        connection_attempts=1,
+                    )
+                else:
+                    outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
             return parse_remote_result(outputs)
         except RuntimeReplacedError as error:
             session.runtime_replaced_at = datetime.datetime.now(datetime.UTC).isoformat()
@@ -1041,7 +1130,21 @@ class ColabManager:
             observed.append(session.endpoint)
             if index + 1 < observations and interval:
                 await asyncio.sleep(interval)
-        incarnation = await self._remote_operation("lease_probe", {}, session.name)
+        lease_token = uuid.uuid4().hex
+        issued_at = datetime.datetime.now(datetime.UTC)
+        expires_at = issued_at + datetime.timedelta(hours=1)
+        incarnation = await self._remote_operation(
+            "lease_probe",
+            {
+                "issue_lease_token": lease_token,
+                "lease_expires_at": expires_at.isoformat(),
+            },
+            session.name,
+        )
+        session.operation_lease_token = lease_token
+        session.operation_lease_issued_at = issued_at.isoformat()
+        session.operation_lease_expires_at = expires_at.isoformat()
+        self.store.add(session)
         return {
             "status": "stable",
             "session": session.name,
@@ -1049,17 +1152,89 @@ class ColabManager:
             "observations": len(observed),
             "runtime_fingerprint": incarnation["runtime_fingerprint"],
             "observed_at": incarnation["observed_at"],
+            "lease_token": lease_token,
+            "lease_expires_at": expires_at.isoformat(),
         }
+
+    def _validate_operation_lease(self, session: SessionState, lease_token: str) -> None:
+        expected = getattr(session, "operation_lease_token", None)
+        expires_at = getattr(session, "operation_lease_expires_at", None)
+        if not expected or lease_token != expected:
+            raise OperationLeaseError(
+                "operation_lease_stale",
+                "The opaque lease does not match the latest probe for this session.",
+                {"session": session.name},
+            )
+        if not expires_at or datetime.datetime.fromisoformat(expires_at) <= datetime.datetime.now(
+            datetime.UTC
+        ):
+            raise OperationLeaseError(
+                "operation_lease_expired",
+                "The operation lease expired; call colab_allocation_probe again.",
+                {"session": session.name, "lease_expires_at": expires_at},
+            )
+
+    async def _operation_lease(
+        self, name: str | None, lease_token: str | None
+    ) -> tuple[SessionState, dict[str, Any]]:
+        """Resolve an explicit lease or issue one, then recheck assignment ownership quickly."""
+        session = self.resolve(name)
+        if lease_token is None:
+            lease = await self.allocation_probe(session.name)
+            lease_token = lease["lease_token"]
+        else:
+            self._validate_operation_lease(session, lease_token)
+            lease = {
+                "status": "accepted",
+                "session": session.name,
+                "endpoint": session.endpoint,
+                "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+                "lease_token": lease_token,
+                "lease_expires_at": getattr(session, "operation_lease_expires_at", None),
+            }
+        started = time.monotonic()
+        try:
+            assignments = await asyncio.wait_for(
+                asyncio.to_thread(self.client().list_assignments), timeout=5
+            )
+        except TimeoutError as error:
+            raise OperationLeaseError(
+                "assignment_lookup_timed_out",
+                "Colab assignment lookup did not complete within five seconds.",
+                {"session": session.name, "elapsed_seconds": round(time.monotonic() - started, 3)},
+            ) from error
+        if session.endpoint not in {item.endpoint for item in assignments}:
+            raise OperationLeaseError(
+                "assignment_no_longer_exists",
+                "The tracked Colab assignment is no longer active.",
+                {"session": session.name, "elapsed_seconds": round(time.monotonic() - started, 3)},
+            )
+        lease["assignment_lookup_seconds"] = round(time.monotonic() - started, 3)
+        return session, lease
+
+    async def _critical_heartbeat(self, session: SessionState, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            with contextlib.suppress(Exception):
+                await self._keepalive_once(session)
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=min(self.keepalive_seconds, 15))
+            except TimeoutError:
+                pass
 
     def _replacement_error(
         self, session: SessionState, reason: str, process_id: str | None = None
     ) -> RuntimeReplacedError:
         last_known = self.process_journal.get(session.name, process_id) if process_id else None
+        probable_cause = (
+            "runtime_incarnation_marker_missing_after_backend_reset_or_reclamation"
+            if "observed missing" in reason
+            else "endpoint_now_points_to_a_different_runtime_incarnation"
+        )
         details = {
             "code": "runtime_replaced",
             "session": session.name,
             "process_id": process_id,
-            "probable_cause": "colab_runtime_recycle_or_runtime_oom",
+            "probable_cause": probable_cause,
             "message": reason,
             "last_known_process": last_known,
         }
@@ -1083,9 +1258,9 @@ class ColabManager:
             "diagnostic": {
                 "code": code,
                 "probable_cause": (
-                    "colab_runtime_recycle_or_runtime_oom"
+                    "runtime_incarnation_changed; process OOM is not inferred"
                     if code == "runtime_replaced"
-                    else "remote_process_state_lost_or_runtime_oom"
+                    else "process_state_missing; inspect runtime memory and system logs for OOM evidence"
                 ),
                 "message": message,
             },
@@ -1144,12 +1319,16 @@ class ColabManager:
         environment: dict[str, str] | None = None,
         output_limit: int = DEFAULT_PROCESS_OUTPUT_LIMIT,
         export_on_exit: list[AutoExportRule] | None = None,
+        lease_token: str | None = None,
     ) -> dict[str, Any]:
         """Start a detached process whose metadata and logs live on the runtime."""
         validate_argv(argv)
         environment = validate_environment(environment)
         output_limit = validate_process_output_limit(output_limit)
         export_rules = self._normalize_auto_exports(export_on_exit)
+        operation_started = time.monotonic()
+        session, lease = await self._operation_lease(name, lease_token)
+        submission_started = time.monotonic()
         result = await self._remote_operation(
             "process_start",
             {
@@ -1159,9 +1338,14 @@ class ColabManager:
                 "environment": environment,
                 "output_limit": output_limit,
             },
-            name,
+            session.name,
+            lease_token=lease["lease_token"],
         )
-        session = self.resolve(name)
+        result["timings"] = {
+            "assignment_lookup_seconds": lease["assignment_lookup_seconds"],
+            "request_and_remote_start_seconds": round(time.monotonic() - submission_started, 3),
+            "total_seconds": round(time.monotonic() - operation_started, 3),
+        }
         journaled = self.process_journal.update(
             session.name,
             {
@@ -1393,9 +1577,20 @@ class ColabManager:
         )
 
     async def _remote_stat_or_none(
-        self, path: str, name: str | None, checksum: bool = False
+        self,
+        path: str,
+        name: str | None,
+        checksum: bool = False,
+        lease_token: str | None = None,
     ) -> dict[str, Any] | None:
         try:
+            if lease_token:
+                return await self._remote_operation(
+                    "fs_stat",
+                    {"path": path, "checksum": checksum},
+                    name,
+                    lease_token=lease_token,
+                )
             return await self.filesystem_stat(path, name, checksum)
         except RemoteOperationError as error:
             if str(error).startswith("FileNotFoundError:"):
@@ -1415,8 +1610,11 @@ class ColabManager:
         compression: str = "auto",
         compression_min_bytes: int = 1_048_576,
         compression_min_savings: float = 0.10,
+        lease_token: str | None = None,
+        transfer_id: str | None = None,
+        progress: ProgressCallback | None = None,
     ) -> dict[str, Any]:
-        """Upload files through staged, checksummed runtime filesystem writes."""
+        """Upload resumable files under one operation-bound runtime lease."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
         compression, compression_min_bytes, compression_min_savings = _compression_settings(
             compression, compression_min_bytes, compression_min_savings
@@ -1436,126 +1634,338 @@ class ColabManager:
             raise ValueError(
                 f"Transfer contains {total} bytes; max_total_bytes is {max_total_bytes}"
             )
-        lease = await self.allocation_probe(name)
+        operation_started = time.monotonic()
+        session, lease = await self._operation_lease(name, lease_token)
+        lease_token = lease["lease_token"]
+        if transfer_id is not None and (
+            len(transfer_id) != 32 or any(char not in "0123456789abcdef" for char in transfer_id)
+        ):
+            raise ValueError("transfer_id must be 32 lowercase hexadecimal characters")
+        transfer_id = transfer_id or uuid.uuid4().hex
+        phase_timings = {"assignment_lookup_seconds": lease["assignment_lookup_seconds"]}
+        progress_count = 0
+
+        async def report(event: dict[str, Any]) -> None:
+            nonlocal progress_count
+            progress_count += 1
+            if progress is not None:
+                await progress(event)
+
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(self._critical_heartbeat(session, heartbeat_stop))
         remote_root = PurePosixPath(remote_path)
         transferred: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        for source_file in files:
-            relative = (
-                PurePosixPath(source_file.name)
-                if source.is_file()
-                else PurePosixPath(*source_file.relative_to(source).parts)
-            )
-            destination = str(remote_root if source.is_file() else remote_root / relative)
-            checksum = await asyncio.to_thread(_file_sha256, source_file)
-            existing = await self._remote_stat_or_none(destination, name, checksum=True)
-            if existing and sync and existing.get("sha256") == checksum:
-                skipped.append(
-                    {"local_path": str(source_file), "remote_path": destination, "sha256": checksum}
+        try:
+            for source_file in files:
+                relative = (
+                    PurePosixPath(source_file.name)
+                    if source.is_file()
+                    else PurePosixPath(*source_file.relative_to(source).parts)
                 )
-                continue
-            if existing and not overwrite:
-                raise FileExistsError(f"Remote destination exists: {destination}")
-            transfer_id = uuid.uuid4().hex
-            wire_temporary = destination + ".colab-mcp-wire-" + transfer_id
-            content_temporary = destination + ".colab-mcp-part-" + transfer_id
-            local_compressed: Path | None = None
-            try:
-                content_bytes = source_file.stat().st_size
-                wire_source = source_file
-                wire_bytes = content_bytes
-                wire_checksum = checksum
-                codec = "none"
-                if compression == "gzip" or (
-                    compression == "auto" and content_bytes >= compression_min_bytes
-                ):
-                    candidate, candidate_bytes, candidate_checksum = await asyncio.to_thread(
-                        _gzip_local_file, source_file
-                    )
-                    if _use_compressed_wire(
-                        compression, content_bytes, candidate_bytes, compression_min_savings
-                    ):
-                        local_compressed = candidate
-                        wire_source = candidate
-                        wire_bytes = candidate_bytes
-                        wire_checksum = candidate_checksum
-                        codec = "gzip"
-                    else:
-                        candidate.unlink(missing_ok=True)
-                first = True
-                with wire_source.open("rb") as handle:
-                    while True:
-                        chunk = handle.read(chunk_size)
-                        if not chunk and not first:
-                            break
-                        await self.filesystem_write(
-                            wire_temporary,
-                            base64.b64encode(chunk).decode(),
-                            name,
-                            append=not first,
-                            create_parents=True,
-                        )
-                        first = False
-                        if not chunk:
-                            break
-                remote_stat = await self.filesystem_stat(wire_temporary, name, checksum=True)
-                if remote_stat.get("sha256") != wire_checksum:
-                    raise RuntimeError(f"Wire checksum mismatch while uploading {source_file}")
-                publication_source = wire_temporary
-                if codec == "gzip":
-                    await self._remote_operation(
-                        "fs_gzip_decompress",
+                destination = str(remote_root if source.is_file() else remote_root / relative)
+                checksum = await asyncio.to_thread(_file_sha256, source_file)
+                existing = await self._remote_stat_or_none(
+                    destination, session.name, checksum=True, lease_token=lease_token
+                )
+                if existing and sync and existing.get("sha256") == checksum:
+                    skipped.append(
                         {
-                            "source": wire_temporary,
-                            "destination": content_temporary,
-                            "expected_size": content_bytes,
-                            "expected_sha256": checksum,
-                            "max_output_bytes": max_total_bytes,
-                        },
-                        name,
+                            "local_path": str(source_file),
+                            "remote_path": destination,
+                            "sha256": checksum,
+                        }
                     )
-                    publication_source = content_temporary
-                await self.filesystem_move(
-                    publication_source, destination, name, overwrite=overwrite
-                )
-                transferred.append(
-                    {
-                        "local_path": str(source_file),
-                        "remote_path": destination,
-                        "size": content_bytes,
-                        "sha256": checksum,
-                        "compression": codec,
-                        "content_bytes": content_bytes,
-                        "wire_bytes": wire_bytes,
-                        "wire_sha256": wire_checksum,
-                        "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
-                    }
-                )
-            finally:
-                if local_compressed is not None:
-                    local_compressed.unlink(missing_ok=True)
-                await self.filesystem_remove(wire_temporary, name, missing_ok=True)
-                await self.filesystem_remove(content_temporary, name, missing_ok=True)
+                    continue
+                if existing and not overwrite:
+                    raise FileExistsError(f"Remote destination exists: {destination}")
+                file_transfer_id = hashlib.sha256(
+                    f"{transfer_id}:{relative.as_posix()}".encode()
+                ).hexdigest()[:32]
+                wire_temporary = destination + ".colab-mcp-wire-" + file_transfer_id
+                content_temporary = destination + ".colab-mcp-part-" + file_transfer_id
+                local_compressed: Path | None = None
+                staged_offset = 0
+                chunks_completed = 0
+                try:
+                    content_bytes = source_file.stat().st_size
+                    wire_source = source_file
+                    wire_bytes = content_bytes
+                    wire_checksum = checksum
+                    codec = "none"
+                    if compression == "gzip" or (
+                        compression == "auto" and content_bytes >= compression_min_bytes
+                    ):
+                        candidate, candidate_bytes, candidate_checksum = await asyncio.to_thread(
+                            _gzip_local_file, source_file
+                        )
+                        if _use_compressed_wire(
+                            compression,
+                            content_bytes,
+                            candidate_bytes,
+                            compression_min_savings,
+                        ):
+                            local_compressed = candidate
+                            wire_source = candidate
+                            wire_bytes = candidate_bytes
+                            wire_checksum = candidate_checksum
+                            codec = "gzip"
+                        else:
+                            candidate.unlink(missing_ok=True)
+                    connection_started = time.monotonic()
+                    staged = await self._remote_stat_or_none(
+                        wire_temporary,
+                        session.name,
+                        checksum=True,
+                        lease_token=lease_token,
+                    )
+                    phase_timings["connection_and_staging_seconds"] = round(
+                        phase_timings.get("connection_and_staging_seconds", 0.0)
+                        + time.monotonic()
+                        - connection_started,
+                        3,
+                    )
+                    if staged:
+                        staged_offset = int(staged["size"])
+                        if staged_offset > wire_bytes:
+                            raise TransferError(
+                                "transfer_resume_conflict",
+                                "Remote staging file is larger than this upload.",
+                                {
+                                    "transfer_id": transfer_id,
+                                    "staging_path": wire_temporary,
+                                    "staged_bytes": staged_offset,
+                                    "wire_bytes": wire_bytes,
+                                },
+                            )
+                        prefix_digest = hashlib.sha256()
+                        with wire_source.open("rb") as prefix_handle:
+                            remaining = staged_offset
+                            while remaining:
+                                prefix = prefix_handle.read(min(1024 * 1024, remaining))
+                                prefix_digest.update(prefix)
+                                remaining -= len(prefix)
+                        if prefix_digest.hexdigest() != staged.get("sha256"):
+                            raise TransferError(
+                                "transfer_resume_conflict",
+                                "Remote staging bytes do not match this local source.",
+                                {
+                                    "transfer_id": transfer_id,
+                                    "staging_path": wire_temporary,
+                                    "staged_bytes": staged_offset,
+                                },
+                            )
+                    transfer_started = time.monotonic()
+                    with wire_source.open("rb") as handle:
+                        handle.seek(staged_offset)
+                        while staged_offset < wire_bytes:
+                            chunk = handle.read(min(chunk_size, wire_bytes - staged_offset))
+                            chunk_number = staged_offset // chunk_size + 1
+                            chunk_started = time.monotonic()
+                            result = await self._remote_operation(
+                                "transfer_upload_chunk",
+                                {
+                                    "path": wire_temporary,
+                                    "offset": staged_offset,
+                                    "data_base64": base64.b64encode(chunk).decode(),
+                                },
+                                session.name,
+                                lease_token=lease_token,
+                            )
+                            staged_offset = int(result["offset"])
+                            chunks_completed += 1
+                            await report(
+                                {
+                                    "phase": "transfer",
+                                    "transfer_id": transfer_id,
+                                    "file": relative.as_posix(),
+                                    "bytes_sent": staged_offset,
+                                    "total_bytes": wire_bytes,
+                                    "chunk_number": int(chunk_number),
+                                    "chunk_seconds": round(time.monotonic() - chunk_started, 3),
+                                    "elapsed_seconds": round(
+                                        time.monotonic() - operation_started, 3
+                                    ),
+                                    "resumed": bool(result.get("already_applied")),
+                                }
+                            )
+                    phase_timings["data_transfer_seconds"] = round(
+                        phase_timings.get("data_transfer_seconds", 0.0)
+                        + time.monotonic()
+                        - transfer_started,
+                        3,
+                    )
+                    verify_started = time.monotonic()
+                    remote_stat = await self._remote_operation(
+                        "fs_stat",
+                        {"path": wire_temporary, "checksum": True},
+                        session.name,
+                        lease_token=lease_token,
+                    )
+                    if remote_stat.get("sha256") != wire_checksum:
+                        raise RuntimeError(f"Wire checksum mismatch while uploading {source_file}")
+                    phase_timings["verification_seconds"] = round(
+                        phase_timings.get("verification_seconds", 0.0)
+                        + time.monotonic()
+                        - verify_started,
+                        3,
+                    )
+                    publication_started = time.monotonic()
+                    publication_source = wire_temporary
+                    if codec == "gzip":
+                        await self._remote_operation(
+                            "fs_gzip_decompress",
+                            {
+                                "source": wire_temporary,
+                                "destination": content_temporary,
+                                "expected_size": content_bytes,
+                                "expected_sha256": checksum,
+                                "max_output_bytes": max_total_bytes,
+                            },
+                            session.name,
+                            lease_token=lease_token,
+                        )
+                        publication_source = content_temporary
+                    await self._remote_operation(
+                        "fs_move",
+                        {
+                            "source": publication_source,
+                            "destination": destination,
+                            "overwrite": overwrite,
+                        },
+                        session.name,
+                        lease_token=lease_token,
+                    )
+                    phase_timings["publication_seconds"] = round(
+                        phase_timings.get("publication_seconds", 0.0)
+                        + time.monotonic()
+                        - publication_started,
+                        3,
+                    )
+                    transferred.append(
+                        {
+                            "local_path": str(source_file),
+                            "remote_path": destination,
+                            "size": content_bytes,
+                            "sha256": checksum,
+                            "compression": codec,
+                            "content_bytes": content_bytes,
+                            "wire_bytes": wire_bytes,
+                            "wire_sha256": wire_checksum,
+                            "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
+                            "resumed_from_bytes": int(staged.get("size", 0)) if staged else 0,
+                        }
+                    )
+                    with contextlib.suppress(Exception):
+                        await self._remote_operation(
+                            "fs_remove",
+                            {"path": wire_temporary, "recursive": False, "missing_ok": True},
+                            session.name,
+                            lease_token=lease_token,
+                        )
+                except Exception as error:
+                    if isinstance(
+                        error, (TransferError, OperationLeaseError, RuntimeReplacedError)
+                    ):
+                        raise
+                    code = getattr(error, "code", "transfer_failed_staging_preserved")
+                    raise TransferError(
+                        code,
+                        str(error),
+                        {
+                            "transfer_id": transfer_id,
+                            "session": session.name,
+                            "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+                            "staging_path": wire_temporary,
+                            "staged_bytes": staged_offset,
+                            "chunks_completed": chunks_completed,
+                            "request_submission": (
+                                "not_submitted"
+                                if isinstance(error, KernelConnectionError)
+                                else "unknown_after_error"
+                            ),
+                            "safe_to_resume": True,
+                            "resume_requires_same_incarnation": True,
+                            "elapsed_seconds": round(time.monotonic() - operation_started, 3),
+                        },
+                    ) from error
+                finally:
+                    if local_compressed is not None:
+                        local_compressed.unlink(missing_ok=True)
+        finally:
+            heartbeat_stop.set()
+            await asyncio.gather(heartbeat, return_exceptions=True)
         wire_total = sum(int(item["wire_bytes"]) for item in transferred)
+        phase_timings["total_seconds"] = round(time.monotonic() - operation_started, 3)
         return {
+            "transfer_id": transfer_id,
             "files_transferred": transferred,
             "files_skipped": skipped,
             "total_bytes": total,
             "wire_bytes": wire_total,
             "compression": compression,
             "lease": lease,
+            "progress_events_emitted": progress_count,
+            "timings": phase_timings,
+            "staging_cleanup": "published staging removed; failed staging preserved for resume",
         }
 
+    async def transfer_cleanup(
+        self, staging_paths: list[str], name: str | None, lease_token: str | None = None
+    ) -> dict[str, Any]:
+        """Explicitly remove only colab-mcp transfer staging paths under an owned lease."""
+        if not staging_paths or len(staging_paths) > 1_000:
+            raise ValueError("staging_paths must contain 1-1000 paths")
+        if any(
+            ".colab-mcp-wire-" not in path and ".colab-mcp-part-" not in path
+            for path in staging_paths
+        ):
+            raise ValueError("Every path must be a colab-mcp wire or publication staging path")
+        session, lease = await self._operation_lease(name, lease_token)
+        removed = []
+        missing = []
+        for path in staging_paths:
+            existing = await self._remote_stat_or_none(
+                path, session.name, lease_token=lease["lease_token"]
+            )
+            if existing is None:
+                missing.append(path)
+                continue
+            await self._remote_operation(
+                "fs_remove",
+                {"path": path, "recursive": False, "missing_ok": True},
+                session.name,
+                lease_token=lease["lease_token"],
+            )
+            removed.append(path)
+        return {"removed": removed, "already_missing": missing, "lease": lease}
+
     async def _remote_files(
-        self, path: str, name: str | None, max_files: int
+        self, path: str, name: str | None, max_files: int, lease_token: str | None = None
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-        root = await self.filesystem_stat(path, name)
+        if lease_token:
+            root = await self._remote_operation(
+                "fs_stat", {"path": path, "checksum": False}, name, lease_token=lease_token
+            )
+        else:
+            root = await self.filesystem_stat(path, name)
         if root["kind"] == "file":
             return root, [root]
         pending = [root["path"]]
         files: list[dict[str, Any]] = []
         while pending:
-            listing = await self.filesystem_list(pending.pop(), name, limit=min(max_files, 10_000))
+            pending_path = pending.pop()
+            if lease_token:
+                listing = await self._remote_operation(
+                    "fs_list",
+                    {"path": pending_path, "limit": min(max_files, 10_000)},
+                    name,
+                    lease_token=lease_token,
+                )
+            else:
+                listing = await self.filesystem_list(
+                    pending_path, name, limit=min(max_files, 10_000)
+                )
             if listing["truncated"]:
                 raise ValueError("Remote directory exceeds max_files listing bound")
             for entry in listing["entries"]:
@@ -1580,14 +1990,20 @@ class ColabManager:
         compression: str = "auto",
         compression_min_bytes: int = 1_048_576,
         compression_min_savings: float = 0.10,
+        lease_token: str | None = None,
     ) -> dict[str, Any]:
         """Download files through checksummed chunks and atomic local replacement."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
         compression, compression_min_bytes, compression_min_savings = _compression_settings(
             compression, compression_min_bytes, compression_min_savings
         )
-        lease = await self.allocation_probe(name)
-        root, files = await self._remote_files(remote_path, name, max_files)
+        operation_started = time.monotonic()
+        session, lease = await self._operation_lease(name, lease_token)
+        lease_token = lease["lease_token"]
+        last_heartbeat = time.monotonic()
+        root, files = await self._remote_files(
+            remote_path, session.name, max_files, lease_token=lease_token
+        )
         total = sum(int(item["size"]) for item in files)
         if total > max_total_bytes:
             raise ValueError(
@@ -1616,7 +2032,12 @@ class ColabManager:
                 and destination_root not in destination.parents
             ):
                 raise ValueError("Remote path would escape the local destination")
-            remote_stat = await self.filesystem_stat(item["path"], name, checksum=True)
+            remote_stat = await self._remote_operation(
+                "fs_stat",
+                {"path": item["path"], "checksum": True},
+                session.name,
+                lease_token=lease_token,
+            )
             checksum = remote_stat["sha256"]
             if (
                 destination.exists()
@@ -1656,7 +2077,8 @@ class ColabManager:
                             "destination": remote_compressed,
                             "max_input_bytes": max_total_bytes,
                         },
-                        name,
+                        session.name,
+                        lease_token=lease_token,
                     )
                     candidate_bytes = int(candidate["size"])
                     if _use_compressed_wire(
@@ -1667,7 +2089,12 @@ class ColabManager:
                         wire_checksum = candidate["sha256"]
                         codec = "gzip"
                     else:
-                        await self.filesystem_remove(remote_compressed, name, missing_ok=True)
+                        await self._remote_operation(
+                            "fs_remove",
+                            {"path": remote_compressed, "recursive": False, "missing_ok": True},
+                            session.name,
+                            lease_token=lease_token,
+                        )
                         remote_compressed = None
                 offset = 0
                 content_written = 0
@@ -1676,7 +2103,12 @@ class ColabManager:
                 decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if codec == "gzip" else None
                 with temporary.open("wb") as handle:
                     while True:
-                        chunk = await self.filesystem_read(wire_path, name, offset, chunk_size)
+                        chunk = await self._remote_operation(
+                            "fs_read",
+                            {"path": wire_path, "offset": offset, "limit": chunk_size},
+                            session.name,
+                            lease_token=lease_token,
+                        )
                         wire_data = base64.b64decode(chunk["data_base64"], validate=True)
                         wire_digest.update(wire_data)
                         content_data = (
@@ -1688,6 +2120,9 @@ class ColabManager:
                         content_digest.update(content_data)
                         handle.write(content_data)
                         offset = chunk["next_offset"]
+                        if time.monotonic() - last_heartbeat >= 15:
+                            await self._keepalive_once(session)
+                            last_heartbeat = time.monotonic()
                         if chunk["eof"]:
                             break
                     if decompressor:
@@ -1720,7 +2155,12 @@ class ColabManager:
             finally:
                 temporary.unlink(missing_ok=True)
                 if remote_compressed is not None:
-                    await self.filesystem_remove(remote_compressed, name, missing_ok=True)
+                    await self._remote_operation(
+                        "fs_remove",
+                        {"path": remote_compressed, "recursive": False, "missing_ok": True},
+                        session.name,
+                        lease_token=lease_token,
+                    )
         wire_total = sum(int(item["wire_bytes"]) for item in transferred)
         return {
             "files_transferred": transferred,
@@ -1729,6 +2169,10 @@ class ColabManager:
             "wire_bytes": wire_total,
             "compression": compression,
             "lease": lease,
+            "timings": {
+                "assignment_lookup_seconds": lease["assignment_lookup_seconds"],
+                "total_seconds": round(time.monotonic() - operation_started, 3),
+            },
         }
 
     async def process_export(

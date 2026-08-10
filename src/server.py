@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
 from contextlib import asynccontextmanager
 from typing import Annotated, Literal
 
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .logging_config import configure_logging
@@ -64,6 +65,12 @@ MaxTotalBytes = Annotated[
 ]
 MaxFiles = Annotated[
     int, Field(ge=1, le=100_000, description="Hard file-count limit for a directory transfer.")
+]
+LeaseToken = Annotated[
+    str | None,
+    Field(
+        description="Opaque operation-bound lease from colab_allocation_probe. Null performs a fresh probe."
+    ),
 ]
 CompressionMode = Annotated[
     Literal["auto", "gzip", "none"],
@@ -202,7 +209,7 @@ async def colab_start(
 ) -> dict:
     """Allocate a Colab CPU or GPU runtime under the authenticated personal account."""
     result = await manager.start(session, gpu)
-    return result.model_dump(exclude={"token"})
+    return result.model_dump(exclude={"token", "operation_lease_token"})
 
 
 @mcp.tool()
@@ -266,10 +273,11 @@ async def colab_process_start(
             description="Optional durable auto-export rules. They poll in the MCP background, survive server restart, and never release the runtime."
         ),
     ] = None,
+    lease_token: LeaseToken = None,
 ) -> dict:
     """Start a durable command; optional exit-code rules auto-export without releasing compute."""
     return await manager.process_start(
-        argv, session, cwd, environment, output_limit, export_on_exit
+        argv, session, cwd, environment, output_limit, export_on_exit, lease_token
     )
 
 
@@ -454,6 +462,7 @@ async def colab_fs_remove(
 async def colab_transfer_upload(
     local_path: LocalPath,
     remote_path: RemotePath,
+    ctx: Context,
     session: SessionSelector = None,
     overwrite: Overwrite = False,
     sync: Annotated[
@@ -465,21 +474,54 @@ async def colab_transfer_upload(
     compression: CompressionMode = "auto",
     compression_min_bytes: CompressionMinBytes = 1_048_576,
     compression_min_savings: CompressionMinSavings = 0.10,
+    lease_token: LeaseToken = None,
+    transfer_id: Annotated[
+        str | None,
+        Field(
+            description="Opaque 32-character transfer ID from a failed upload. Reuse it to resume on the same incarnation; null starts a new transfer."
+        ),
+    ] = None,
 ) -> dict:
-    """Upload a file/directory with staged chunks, SHA-256 verification, and sync skips."""
+    """Upload resumable chunks under one lease with MCP progress and atomic publication."""
+
+    async def progress(event: dict) -> None:
+        await ctx.report_progress(
+            event["bytes_sent"], event["total_bytes"], json.dumps(event, separators=(",", ":"))
+        )
+
     return await manager.transfer_upload(
-        local_path,
-        remote_path,
-        session,
-        overwrite,
-        sync,
-        chunk_size,
-        max_total_bytes,
-        max_files,
-        compression,
-        compression_min_bytes,
-        compression_min_savings,
+        local_path=local_path,
+        remote_path=remote_path,
+        name=session,
+        overwrite=overwrite,
+        sync=sync,
+        chunk_size=chunk_size,
+        max_total_bytes=max_total_bytes,
+        max_files=max_files,
+        compression=compression,
+        compression_min_bytes=compression_min_bytes,
+        compression_min_savings=compression_min_savings,
+        lease_token=lease_token,
+        transfer_id=transfer_id,
+        progress=progress,
     )
+
+
+@mcp.tool()
+async def colab_transfer_cleanup(
+    staging_paths: Annotated[
+        list[str],
+        Field(
+            min_length=1,
+            max_length=1_000,
+            description="Explicit remote staging_path values returned by failed transfers; ordinary files are rejected.",
+        ),
+    ],
+    session: SessionSelector = None,
+    lease_token: LeaseToken = None,
+) -> dict:
+    """Remove abandoned transfer staging files under the same operation-bound lease."""
+    return await manager.transfer_cleanup(staging_paths, session, lease_token)
 
 
 @mcp.tool()
@@ -511,6 +553,7 @@ async def colab_transfer_download(
     compression: CompressionMode = "auto",
     compression_min_bytes: CompressionMinBytes = 1_048_576,
     compression_min_savings: CompressionMinSavings = 0.10,
+    lease_token: LeaseToken = None,
 ) -> dict:
     """Download a file/directory with bounded chunks, SHA-256, and atomic publication."""
     return await manager.transfer_download(
@@ -525,6 +568,7 @@ async def colab_transfer_download(
         compression,
         compression_min_bytes,
         compression_min_savings,
+        lease_token,
     )
 
 

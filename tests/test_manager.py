@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import os
+import time
 import zlib
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,7 +23,10 @@ from src.cli import (
 from src.manager import (
     AutoExportRule,
     ColabManager,
+    KernelConnectionError,
     ManagedSessionState,
+    OperationLeaseError,
+    TransferError,
     _bound_outputs,
     _json_safe,
     _secure_permissions,
@@ -35,9 +39,26 @@ def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ColabManager:
     instance = ColabManager()
 
     async def stable_probe(*_args, **_kwargs):
-        return {"status": "stable", "observations": 2}
+        return {"status": "stable", "observations": 2, "lease_token": "b" * 32}
+
+    async def stable_operation_lease(name, lease_token=None):
+        runtime = SimpleNamespace(
+            name=name or "runtime",
+            endpoint="endpoint",
+            runtime_fingerprint="a" * 32,
+        )
+        return runtime, {
+            "status": "stable",
+            "lease_token": lease_token or "b" * 32,
+            "assignment_lookup_seconds": 0.001,
+        }
+
+    async def quiet_heartbeat(_session, stop):
+        await stop.wait()
 
     instance.allocation_probe = stable_probe
+    instance._operation_lease = stable_operation_lease
+    instance._critical_heartbeat = quiet_heartbeat
     return instance
 
 
@@ -534,8 +555,11 @@ def test_allocation_probe_observes_owned_lease_and_runtime_incarnation(tmp_path,
         def keep_alive_assignment(self, endpoint):
             keepalives.append(endpoint)
 
-    async def remote(operation, payload, name, timeout=120):
-        assert (operation, payload, name) == ("lease_probe", {}, "runtime")
+    async def remote(operation, payload, name, timeout=120, **_kwargs):
+        assert operation == "lease_probe"
+        assert name == "runtime"
+        assert len(payload["issue_lease_token"]) == 32
+        assert payload["lease_expires_at"]
         return {
             "status": "stable",
             "runtime_fingerprint": "a" * 32,
@@ -551,6 +575,8 @@ def test_allocation_probe_observes_owned_lease_and_runtime_incarnation(tmp_path,
     assert result["status"] == "stable"
     assert result["observations"] == 3
     assert result["runtime_fingerprint"] == "a" * 32
+    assert len(result["lease_token"]) == 32
+    assert instance.store.get("runtime").operation_lease_token == result["lease_token"]
     assert keepalives == ["endpoint", "endpoint", "endpoint"]
 
 
@@ -565,6 +591,36 @@ def test_allocation_probe_fails_before_remote_access_when_lease_is_lost(tmp_path
     instance.client = lambda: FakeClient()
     with pytest.raises(RuntimeError, match="allocation_lease_lost"):
         asyncio.run(ColabManager.allocation_probe(instance, "runtime", interval=0))
+
+
+def test_explicit_operation_lease_fails_fast_when_assignment_vanished(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+
+    class MissingClient:
+        def list_assignments(self):
+            return []
+
+    instance.client = lambda: MissingClient()
+    started = time.monotonic()
+    with pytest.raises(OperationLeaseError) as caught:
+        asyncio.run(ColabManager._operation_lease(instance, "runtime", "b" * 32))
+    assert caught.value.code == "assignment_no_longer_exists"
+    assert time.monotonic() - started < 5
+
+
+def test_stale_operation_lease_is_rejected_before_assignment_lookup(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    with pytest.raises(OperationLeaseError) as caught:
+        ColabManager._validate_operation_lease(instance, runtime, "c" * 32)
+    assert caught.value.code == "operation_lease_stale"
 
 
 def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -641,72 +697,129 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
     source = tmp_path / "source.bin"
     source.write_bytes(b"abcdefgh")
     expected_checksum = hashlib.sha256(source.read_bytes()).hexdigest()
-    writes = []
+    wire = bytearray()
     moves = []
     removes = []
-    events = []
-
-    async def probe(*_args, **_kwargs):
-        events.append("probe")
-        return {"status": "stable", "observations": 2}
+    progress = []
 
     async def stat_or_none(*_args, **_kwargs):
-        events.append("stat")
         return None
 
-    async def write(path, data, name, append=False, create_parents=False):
-        writes.append((path, base64.b64decode(data), append, create_parents))
+    async def remote(operation, payload, _name, **_kwargs):
+        if operation == "transfer_upload_chunk":
+            data = base64.b64decode(payload["data_base64"])
+            assert payload["offset"] == len(wire)
+            wire.extend(data)
+            return {"offset": len(wire), "already_applied": False}
+        if operation == "fs_stat":
+            return {"size": len(wire), "sha256": hashlib.sha256(wire).hexdigest()}
+        if operation == "fs_move":
+            moves.append(payload)
+            return {}
+        if operation == "fs_remove":
+            removes.append(payload)
+            return {}
+        raise AssertionError(operation)
 
-    async def stat(path, name, checksum=False):
-        return {"path": path, "kind": "file", "size": 8, "sha256": expected_checksum}
-
-    async def move(source_path, destination, name, overwrite=False):
-        moves.append((source_path, destination, overwrite))
-
-    async def remove(path, name, recursive=False, missing_ok=False):
-        removes.append((path, missing_ok))
+    async def on_progress(event):
+        progress.append(event)
 
     instance._remote_stat_or_none = stat_or_none
-    instance.allocation_probe = probe
-    instance.filesystem_write = write
-    instance.filesystem_stat = stat
-    instance.filesystem_move = move
-    instance.filesystem_remove = remove
+    instance._remote_operation = remote
     result = asyncio.run(
-        instance.transfer_upload(str(source), "/content/destination.bin", "runtime", chunk_size=3)
+        instance.transfer_upload(
+            str(source),
+            "/content/destination.bin",
+            "runtime",
+            chunk_size=3,
+            progress=on_progress,
+        )
     )
-    assert [item[1] for item in writes] == [b"abc", b"def", b"gh"]
-    assert [item[2] for item in writes] == [False, True, True]
-    assert moves[0][1:] == ("/content/destination.bin", False)
-    assert removes[0][1] is True
+    assert bytes(wire) == b"abcdefgh"
+    assert [item["bytes_sent"] for item in progress] == [3, 6, 8]
+    assert moves[0]["destination"] == "/content/destination.bin"
+    assert removes[0]["missing_ok"] is True
     assert result["files_transferred"][0]["sha256"] == expected_checksum
     assert result["lease"]["status"] == "stable"
-    assert events[:2] == ["probe", "stat"]
+    assert result["progress_events_emitted"] == 3
+    assert result["timings"]["total_seconds"] >= 0
 
 
-def test_upload_interruption_cleans_remote_partial(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_upload_interruption_preserves_remote_partial_for_resume(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     instance = manager(tmp_path, monkeypatch)
     source = tmp_path / "source.bin"
     source.write_bytes(b"abcdef")
-    removed = []
 
     async def stat_or_none(*_args, **_kwargs):
         return None
 
-    async def write(*_args, **_kwargs):
-        raise OSError("interrupted")
-
-    async def remove(path, *_args, **_kwargs):
-        removed.append(path)
+    async def remote(operation, *_args, **_kwargs):
+        if operation == "transfer_upload_chunk":
+            raise KernelConnectionError("connection failed")
+        raise AssertionError(operation)
 
     instance._remote_stat_or_none = stat_or_none
-    instance.filesystem_write = write
-    instance.filesystem_remove = remove
-    with pytest.raises(OSError, match="interrupted"):
+    instance._remote_operation = remote
+    with pytest.raises(TransferError) as caught:
         asyncio.run(instance.transfer_upload(str(source), "/content/file", "runtime"))
-    assert len(removed) == 2
-    assert any(".colab-mcp-wire-" in path for path in removed)
-    assert any(".colab-mcp-part-" in path for path in removed)
+    assert caught.value.code == "kernel_connection_failed_request_not_submitted"
+    assert caught.value.details["request_submission"] == "not_submitted"
+    assert caught.value.details["safe_to_resume"] is True
+    assert ".colab-mcp-wire-" in caught.value.details["staging_path"]
+
+
+def test_upload_resumes_verified_staging_on_same_incarnation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "source.bin"
+    source.write_bytes(b"abcdefgh")
+    transfer_id = "d" * 32
+    staged = bytearray(b"abc")
+    stat_calls = 0
+    progress = []
+
+    async def stat_or_none(*_args, **_kwargs):
+        nonlocal stat_calls
+        stat_calls += 1
+        if stat_calls == 1:
+            return None
+        return {
+            "size": len(staged),
+            "sha256": hashlib.sha256(staged).hexdigest(),
+        }
+
+    async def remote(operation, payload, _name, **_kwargs):
+        if operation == "transfer_upload_chunk":
+            assert payload["offset"] == len(staged)
+            staged.extend(base64.b64decode(payload["data_base64"]))
+            return {"offset": len(staged), "already_applied": False}
+        if operation == "fs_stat":
+            return {"size": len(staged), "sha256": hashlib.sha256(staged).hexdigest()}
+        if operation in {"fs_move", "fs_remove"}:
+            return {}
+        raise AssertionError(operation)
+
+    async def on_progress(event):
+        progress.append(event)
+
+    instance._remote_stat_or_none = stat_or_none
+    instance._remote_operation = remote
+    result = asyncio.run(
+        instance.transfer_upload(
+            str(source),
+            "/content/file",
+            "runtime",
+            chunk_size=3,
+            transfer_id=transfer_id,
+            progress=on_progress,
+        )
+    )
+    assert bytes(staged) == b"abcdefgh"
+    assert [event["bytes_sent"] for event in progress] == [6, 8]
+    assert result["files_transferred"][0]["resumed_from_bytes"] == 3
 
 
 def test_upload_forced_gzip_verifies_wire_and_content(
@@ -716,46 +829,32 @@ def test_upload_forced_gzip_verifies_wire_and_content(
     content = b"compressible payload\n" * 200
     source = tmp_path / "source.bin"
     source.write_bytes(content)
-    writes: list[bytes] = []
+    wire = bytearray()
     operations = []
 
     async def stat_or_none(*_args, **_kwargs):
         return None
 
-    async def write(_path, data, _name, append=False, create_parents=False):
-        writes.append(base64.b64decode(data))
-
-    async def stat(path, _name, checksum=False):
-        wire = b"".join(writes)
-        return {
-            "path": path,
-            "kind": "file",
-            "size": len(wire),
-            "sha256": hashlib.sha256(wire).hexdigest(),
-        }
-
-    async def operation(operation, payload, _name):
+    async def operation(operation, payload, _name, **_kwargs):
         operations.append((operation, payload))
-        return {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
-
-    async def no_op(*_args, **_kwargs):
-        return None
+        if operation == "transfer_upload_chunk":
+            data = base64.b64decode(payload["data_base64"])
+            wire.extend(data)
+            return {"offset": len(wire), "already_applied": False}
+        if operation == "fs_stat":
+            return {"size": len(wire), "sha256": hashlib.sha256(wire).hexdigest()}
+        return {}
 
     instance._remote_stat_or_none = stat_or_none
-    instance.filesystem_write = write
-    instance.filesystem_stat = stat
     instance._remote_operation = operation
-    instance.filesystem_move = no_op
-    instance.filesystem_remove = no_op
     result = asyncio.run(
         instance.transfer_upload(
             str(source), "/content/file", "runtime", compression="gzip", chunk_size=41
         )
     )
-    wire = b"".join(writes)
-    assert gzip.decompress(wire) == content
-    assert operations[0][0] == "fs_gzip_decompress"
-    assert operations[0][1]["expected_sha256"] == hashlib.sha256(content).hexdigest()
+    assert gzip.decompress(bytes(wire)) == content
+    decompress = next(item for item in operations if item[0] == "fs_gzip_decompress")
+    assert decompress[1]["expected_sha256"] == hashlib.sha256(content).hexdigest()
     assert result["files_transferred"][0]["compression"] == "gzip"
     assert result["wire_bytes"] < result["total_bytes"]
 
@@ -765,25 +864,26 @@ def test_download_is_chunked_verified_and_atomic(tmp_path: Path, monkeypatch: py
     content = b"abcdefgh"
     checksum = hashlib.sha256(content).hexdigest()
 
-    async def remote_files(*_args):
+    async def remote_files(*_args, **_kwargs):
         item = {"path": "/content/source.bin", "kind": "file", "size": len(content)}
         return item, [item]
 
-    async def stat(*_args, **_kwargs):
-        return {"sha256": checksum}
-
-    async def read(path, name, offset=0, limit=262_144):
-        data = content[offset : offset + limit]
-        next_offset = offset + len(data)
-        return {
-            "data_base64": base64.b64encode(data).decode(),
-            "next_offset": next_offset,
-            "eof": next_offset == len(content),
-        }
+    async def remote(operation, payload, _name, **_kwargs):
+        if operation == "fs_stat":
+            return {"sha256": checksum}
+        if operation == "fs_read":
+            offset = payload["offset"]
+            data = content[offset : offset + payload["limit"]]
+            next_offset = offset + len(data)
+            return {
+                "data_base64": base64.b64encode(data).decode(),
+                "next_offset": next_offset,
+                "eof": next_offset == len(content),
+            }
+        raise AssertionError(operation)
 
     instance._remote_files = remote_files
-    instance.filesystem_stat = stat
-    instance.filesystem_read = read
+    instance._remote_operation = remote
     destination = tmp_path / "download.bin"
     result = asyncio.run(
         instance.transfer_download("/content/source.bin", str(destination), "runtime", chunk_size=3)
@@ -803,33 +903,30 @@ def test_download_forced_gzip_streams_and_verifies_original(
     wire_checksum = hashlib.sha256(wire).hexdigest()
     removed = []
 
-    async def remote_files(*_args):
+    async def remote_files(*_args, **_kwargs):
         item = {"path": "/content/source.bin", "kind": "file", "size": len(content)}
         return item, [item]
 
-    async def stat(*_args, **_kwargs):
-        return {"sha256": checksum}
-
-    async def operation(operation, _payload, _name):
-        assert operation == "fs_gzip_compress"
-        return {"size": len(wire), "sha256": wire_checksum}
-
-    async def read(_path, _name, offset=0, limit=262_144):
-        data = wire[offset : offset + limit]
-        return {
-            "data_base64": base64.b64encode(data).decode(),
-            "next_offset": offset + len(data),
-            "eof": offset + len(data) == len(wire),
-        }
-
-    async def remove(path, *_args, **_kwargs):
-        removed.append(path)
+    async def operation(operation, payload, _name, **_kwargs):
+        if operation == "fs_stat":
+            return {"sha256": checksum}
+        if operation == "fs_gzip_compress":
+            return {"size": len(wire), "sha256": wire_checksum}
+        if operation == "fs_read":
+            offset = payload["offset"]
+            data = wire[offset : offset + payload["limit"]]
+            return {
+                "data_base64": base64.b64encode(data).decode(),
+                "next_offset": offset + len(data),
+                "eof": offset + len(data) == len(wire),
+            }
+        if operation == "fs_remove":
+            removed.append(payload["path"])
+            return {}
+        raise AssertionError(operation)
 
     instance._remote_files = remote_files
-    instance.filesystem_stat = stat
     instance._remote_operation = operation
-    instance.filesystem_read = read
-    instance.filesystem_remove = remove
     destination = tmp_path / "download.bin"
     result = asyncio.run(
         instance.transfer_download(
@@ -850,32 +947,30 @@ def test_download_corrupt_gzip_cleans_partial_and_remote_temp(
     wire = b"not a gzip stream"
     removed = []
 
-    async def remote_files(*_args):
+    async def remote_files(*_args, **_kwargs):
         item = {"path": "/content/source.bin", "kind": "file", "size": len(content)}
         return item, [item]
 
-    async def stat(*_args, **_kwargs):
-        return {"sha256": hashlib.sha256(content).hexdigest()}
-
-    async def operation(*_args, **_kwargs):
-        return {"size": len(wire), "sha256": hashlib.sha256(wire).hexdigest()}
-
-    async def read(_path, _name, offset=0, limit=262_144):
-        data = wire[offset : offset + limit]
-        return {
-            "data_base64": base64.b64encode(data).decode(),
-            "next_offset": offset + len(data),
-            "eof": offset + len(data) == len(wire),
-        }
-
-    async def remove(path, *_args, **_kwargs):
-        removed.append(path)
+    async def operation(operation, payload, _name, **_kwargs):
+        if operation == "fs_stat":
+            return {"sha256": hashlib.sha256(content).hexdigest()}
+        if operation == "fs_gzip_compress":
+            return {"size": len(wire), "sha256": hashlib.sha256(wire).hexdigest()}
+        if operation == "fs_read":
+            offset = payload["offset"]
+            data = wire[offset : offset + payload["limit"]]
+            return {
+                "data_base64": base64.b64encode(data).decode(),
+                "next_offset": offset + len(data),
+                "eof": offset + len(data) == len(wire),
+            }
+        if operation == "fs_remove":
+            removed.append(payload["path"])
+            return {}
+        raise AssertionError(operation)
 
     instance._remote_files = remote_files
-    instance.filesystem_stat = stat
     instance._remote_operation = operation
-    instance.filesystem_read = read
-    instance.filesystem_remove = remove
     destination = tmp_path / "download.bin"
     with pytest.raises(zlib.error):
         asyncio.run(
@@ -1090,7 +1185,7 @@ def test_process_start_persists_typed_auto_export_rules(tmp_path, monkeypatch):
     instance.store.add(session("runtime", "endpoint"))
     watchers = []
 
-    async def remote(operation, payload, name, timeout=120):
+    async def remote(operation, payload, name, timeout=120, **_kwargs):
         assert operation == "process_start"
         return {
             "process_id": payload["process_id"],
