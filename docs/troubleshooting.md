@@ -106,3 +106,9 @@ lease and source file are stable.
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,
 VRAM, driver, and CUDA values returned. A CPU result contains an empty GPU list.
+# Agent-visible recovery guidance
+
+Every MCP tool description includes the recovery action for failures specific to that
+operation. The server-level instructions define the common error-code playbook. MCP
+clients should expose both descriptions to the agent; if a client hides server
+instructions, the tool descriptions remain sufficient for the immediate next action.

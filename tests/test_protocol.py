@@ -36,6 +36,26 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 assert not health.isError
                 assert not compute_units.isError
 
+                recovery_terms = {
+                    "colab_sessions": "stale",
+                    "colab_keepalive": "reclamation",
+                    "colab_start": "quota",
+                    "colab_execute": "durable",
+                    "colab_run_command": "poll",
+                    "colab_process_start": "request_not_submitted",
+                    "colab_process_output": "spool",
+                    "colab_process_export": "retry",
+                    "colab_transfer_upload": "transfer_id",
+                    "colab_allocation_probe": "never follow replacement",
+                    "colab_transfer_download": "sync=true",
+                    "colab_stop": "permanently loses",
+                }
+                descriptions = {tool.name: tool.description or "" for tool in tools.tools}
+                for tool_name, recovery_term in recovery_terms.items():
+                    assert recovery_term in descriptions[tool_name], (
+                        f"{tool_name} must document recovery strategy {recovery_term!r}"
+                    )
+
                 for tool in tools.tools:
                     schema = tool.inputSchema
                     for name, property_schema in schema.get("properties", {}).items():

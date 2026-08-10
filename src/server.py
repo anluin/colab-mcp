@@ -113,7 +113,18 @@ mcp = FastMCP(
         "Use ephemeral Google Colab compute across Windows, macOS, and Linux. "
         "Prefer T4 unless another accelerator is required. Always stop or pause "
         "sessions after use to release quota. Pause releases the runtime; resume "
-        "creates a fresh runtime and does not preserve RAM or /content files."
+        "creates a fresh runtime and does not preserve RAM or /content files. "
+        "Recovery contract: runtime_missing means the assignment ended; start a new "
+        "session and restore durable inputs. runtime_replaced means Colab recycled the "
+        "backend; never reuse its lease or assume /content/process state survived. "
+        "kernel_connection_failed/request_not_submitted are safe to retry only after a "
+        "fresh allocation probe confirms the same fingerprint. response_lost may have "
+        "executed remotely; inspect process/file state before retrying. operation_timeout "
+        "does not imply cancellation; poll durable processes or signal them explicitly. "
+        "quota_or_preemption requires releasing unused sessions and waiting or changing "
+        "account capacity. local_transport_failure requires restarting the MCP client; "
+        "then use sessions/process_list to recover persisted ownership. Preserve returned "
+        "transfer_id, staging_path, process_id, next_offset, and recoverable_export fields."
     ),
     lifespan=server_lifespan,
 )
@@ -136,7 +147,7 @@ async def colab_health() -> dict:
 
 @mcp.tool()
 async def colab_sessions() -> list[dict]:
-    """List locally tracked sessions and whether they still exist on Colab."""
+    """List tracked/live sessions. If stale, reconcile it; do not trust its runtime files."""
     return await manager.sessions()
 
 
@@ -147,7 +158,7 @@ async def colab_keepalive(
         bool, Field(description="True sends a ping now; false only reports persisted/task state.")
     ] = True,
 ) -> dict:
-    """Report heartbeat health and optionally refresh the Colab idle timer immediately."""
+    """Report/refresh heartbeat. It cannot prevent reclamation; on loss, start and restore."""
     return await manager.keepalive(session, refresh)
 
 
@@ -164,7 +175,7 @@ async def colab_reconcile(
         ),
     ] = False,
 ) -> dict:
-    """Audit local versus live assignments; cleanup actions require explicit flags."""
+    """Audit ownership. Forget confirmed stale records; release orphans only if intentional."""
     return await manager.reconcile(forget_stale, release_orphans)
 
 
@@ -179,7 +190,7 @@ async def colab_inspect(
         int, Field(ge=1, le=1_000, description="Maximum OS process rows returned; defaults to 100.")
     ] = 100,
 ) -> dict:
-    """Inspect OS, Python, CPU, RAM, disk, GPU/CUDA, tools, and bounded processes."""
+    """Inspect runtime resources. On incarnation error, discard results and reacquire."""
     return await manager.inspect_runtime(session, tools, process_limit)
 
 
@@ -207,7 +218,7 @@ async def colab_start(
         ),
     ] = "T4",
 ) -> dict:
-    """Allocate a Colab CPU or GPU runtime under the authenticated personal account."""
+    """Allocate compute. On quota/preemption, release unused sessions and retry later."""
     result = await manager.start(session, gpu)
     return result.model_dump(exclude={"token", "operation_lease_token"})
 
@@ -227,7 +238,7 @@ async def colab_execute(
     ] = 100_000,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Execute lease-guarded Python and return outputs plus honest phase timings."""
+    """Execute guarded Python. Timeout may be ambiguous; use durable process_start for long work."""
     return await manager.execute_python_detailed(code, session, timeout, output_limit, lease_token)
 
 
@@ -250,7 +261,7 @@ async def colab_run_command(
         Field(ge=1, le=1_000_000, description="Maximum stdout/stderr bytes returned per stream."),
     ] = 100_000,
 ) -> dict:
-    """Wait for a durable command; on timeout return process_id and leave it running."""
+    """Run durably. Timeout leaves it running: retain process_id, poll output/status, or signal."""
     return await manager.run_command(argv, session, cwd, environment, timeout, output_limit)
 
 
@@ -276,7 +287,7 @@ async def colab_process_start(
     ] = None,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Start a durable command; optional exit-code rules auto-export without releasing compute."""
+    """Start durably under a lease. On connection loss retry only if request_not_submitted."""
     return await manager.process_start(
         argv, session, cwd, environment, output_limit, export_on_exit, lease_token
     )
@@ -284,13 +295,13 @@ async def colab_process_start(
 
 @mcp.tool()
 async def colab_process_status(process_id: ProcessId, session: SessionSelector = None) -> dict:
-    """Inspect a process previously started in the selected runtime."""
+    """Inspect owned process. If runtime vanished, use preserved metadata and restore artifacts."""
     return await manager.process_status(process_id, session)
 
 
 @mcp.tool()
 async def colab_process_list(session: SessionSelector = None) -> list[dict]:
-    """List processes owned by colab-mcp in the selected runtime."""
+    """List persisted owned processes. After restart, use this to recover IDs and export state."""
     return await manager.process_list(session)
 
 
@@ -308,7 +319,7 @@ async def colab_process_output(
         int, Field(ge=1, le=1_000_000, description="Maximum bytes returned; defaults to 65,536.")
     ] = 65_536,
 ) -> dict:
-    """Read a bounded output chunk; pass next_offset to continue incrementally."""
+    """Read retained output. Keep next_offset; on runtime loss, the local spool remains readable."""
     return await manager.process_output(process_id, session, stream, offset, limit)
 
 
@@ -321,7 +332,7 @@ async def colab_process_signal(
         Field(description="Explicit process-group signal; TERM default, KILL is immediate."),
     ] = "TERM",
 ) -> dict:
-    """Signal a running process owned by colab-mcp in the selected runtime."""
+    """Signal an owned process. If already exited/lost, inspect status; never signal a replacement."""
     return await manager.process_signal(process_id, session, signal)
 
 
@@ -345,7 +356,7 @@ async def colab_process_export(
     compression_min_bytes: CompressionMinBytes = 1_048_576,
     compression_min_savings: CompressionMinSavings = 0.10,
 ) -> dict:
-    """Atomically export completed-process files; hold the runtime on any failure."""
+    """Export atomically. Failure holds runtime/stage; retry same call from recoverable_export."""
     return await manager.process_export(
         process_id,
         remote_path,
@@ -369,7 +380,7 @@ async def colab_process_export_cleanup(
     local_path: LocalPath,
     session: SessionSelector = None,
 ) -> dict:
-    """Explicitly discard the deterministic local stage for a recoverable process export."""
+    """Discard failed export stage. Use only after abandoning retry; remote artifacts are unchanged."""
     return await manager.process_export_cleanup(process_id, remote_path, local_path, session)
 
 
@@ -381,7 +392,7 @@ async def colab_fs_list(
     session: SessionSelector = None,
     limit: Annotated[int, Field(ge=1, le=10_000, description="Maximum entries returned.")] = 1_000,
 ) -> dict:
-    """List a bounded number of entries under /content in the selected runtime."""
+    """List runtime paths. On runtime_replaced/missing, reacquire; old /content is unrecoverable."""
     return await manager.filesystem_list(path, session, limit)
 
 
@@ -393,7 +404,7 @@ async def colab_fs_stat(
         bool, Field(description="True computes SHA-256 for a file; default false.")
     ] = False,
 ) -> dict:
-    """Inspect a runtime path; optionally calculate SHA-256 for a file."""
+    """Stat/checksum a path. Missing may mean reclamation; verify the session fingerprint first."""
     return await manager.filesystem_stat(path, session, checksum)
 
 
@@ -406,7 +417,7 @@ async def colab_fs_read(
         int, Field(ge=1, le=1_000_000, description="Maximum bytes returned as base64.")
     ] = 262_144,
 ) -> dict:
-    """Read a bounded binary chunk as base64; use next_offset to continue."""
+    """Read a chunk. Keep next_offset; after incarnation change restart from restored source."""
     return await manager.filesystem_read(path, session, offset, limit)
 
 
@@ -425,7 +436,7 @@ async def colab_fs_write(
         bool, Field(description="True creates missing parent directories; default false.")
     ] = False,
 ) -> dict:
-    """Atomically write up to 1 MB of base64 data, or explicitly append a chunk."""
+    """Write a small chunk. Append retries are not idempotent; stat before retrying ambiguous writes."""
     return await manager.filesystem_write(path, data_base64, session, append, create_parents)
 
 
@@ -440,7 +451,7 @@ async def colab_fs_mkdir(
         bool, Field(description="True accepts an existing directory; defaults to true.")
     ] = True,
 ) -> dict:
-    """Create a directory under /content."""
+    """Create a runtime directory. Use exist_ok for idempotent retry on ambiguous responses."""
     return await manager.filesystem_mkdir(path, session, parents, exist_ok)
 
 
@@ -451,7 +462,7 @@ async def colab_fs_move(
     session: SessionSelector = None,
     overwrite: Overwrite = False,
 ) -> dict:
-    """Move a runtime file or directory; overwrite must be explicit."""
+    """Move a path. After response loss, stat source/destination before retrying."""
     return await manager.filesystem_move(source, destination, session, overwrite)
 
 
@@ -466,7 +477,7 @@ async def colab_fs_remove(
         bool, Field(description="True treats an absent path as success; default false.")
     ] = False,
 ) -> dict:
-    """Remove a runtime path; non-empty directories require recursive=true."""
+    """Remove explicitly. After response loss, stat first; use missing_ok for idempotent cleanup."""
     return await manager.filesystem_remove(path, session, recursive, missing_ok)
 
 
@@ -494,7 +505,7 @@ async def colab_transfer_upload(
         ),
     ] = None,
 ) -> dict:
-    """Upload resumable chunks under one lease with MCP progress and atomic publication."""
+    """Upload atomically with progress. On failure retain transfer_id/staging_path and resume only on the same fingerprint; otherwise clean staging."""
 
     async def progress(event: dict) -> None:
         await ctx.report_progress(
@@ -532,7 +543,7 @@ async def colab_transfer_cleanup(
     session: SessionSelector = None,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Remove abandoned transfer staging files under the same operation-bound lease."""
+    """Remove returned staging paths. If the lease expired, probe and clean only the same runtime."""
     return await manager.transfer_cleanup(staging_paths, session, lease_token)
 
 
@@ -546,7 +557,7 @@ async def colab_allocation_probe(
         float, Field(ge=0, le=5, description="Seconds between observations; defaults to 0.25.")
     ] = 0.25,
 ) -> dict:
-    """Verify assignment ownership and runtime incarnation stability before critical work."""
+    """Issue an operation lease. Pass it immediately; if expired/mismatched, probe again, never follow replacement."""
     return await manager.allocation_probe(session, observations, interval)
 
 
@@ -567,7 +578,7 @@ async def colab_transfer_download(
     compression_min_savings: CompressionMinSavings = 0.10,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Download a file/directory with bounded chunks, SHA-256, and atomic publication."""
+    """Download atomically. On interruption retry with sync=true on the same incarnation; verify hashes."""
     return await manager.transfer_download(
         remote_path,
         local_path,
@@ -593,7 +604,7 @@ async def colab_execute_notebook(
         float, Field(ge=0.1, le=21_600, description="Maximum seconds per code cell.")
     ] = 900,
 ) -> dict:
-    """Execute code cells from a local notebook and save an output notebook locally."""
+    """Execute notebook cells. On failure keep the input/output checkpoint; reacquire and rerun deliberately."""
     return await manager.execute_notebook(source, output, session, cell_timeout)
 
 
@@ -615,7 +626,7 @@ async def colab_download(
 
 @mcp.tool()
 async def colab_stop(session: SessionSelector = None) -> dict:
-    """Release a Colab runtime and cancel its in-process keep-alive task."""
+    """Release compute idempotently. Export first; stopping permanently loses RAM and /content."""
     return await manager.stop(session)
 
 
@@ -624,7 +635,7 @@ async def colab_pause_notebook(
     session: SessionName,
     notebook_path: Annotated[str, Field(description="Existing local .ipynb checkpoint path.")],
 ) -> dict:
-    """Checkpoint a local notebook and release its Colab GPU; RAM and runtime files are not preserved."""
+    """Checkpoint locally then release. Transfer non-notebook artifacts first; /content is lost."""
     return await manager.pause(session, notebook_path)
 
 
@@ -644,7 +655,7 @@ async def colab_resume_notebook(
         float, Field(ge=0.1, le=21_600, description="Maximum seconds per rerun code cell.")
     ] = 900,
 ) -> dict:
-    """Allocate a fresh runtime with the prior GPU preference and optionally rerun the paused notebook."""
+    """Resume onto a fresh runtime. Restore dependencies/files; prior RAM, processes, and leases are invalid."""
     return await manager.resume(session, execute_notebook, output_path, cell_timeout)
 
 
