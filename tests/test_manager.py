@@ -1,8 +1,10 @@
 import asyncio
 import base64
+import gzip
 import hashlib
 import json
 import os
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -702,8 +704,60 @@ def test_upload_interruption_cleans_remote_partial(tmp_path: Path, monkeypatch: 
     instance.filesystem_remove = remove
     with pytest.raises(OSError, match="interrupted"):
         asyncio.run(instance.transfer_upload(str(source), "/content/file", "runtime"))
-    assert len(removed) == 1
-    assert ".colab-mcp-part-" in removed[0]
+    assert len(removed) == 2
+    assert any(".colab-mcp-wire-" in path for path in removed)
+    assert any(".colab-mcp-part-" in path for path in removed)
+
+
+def test_upload_forced_gzip_verifies_wire_and_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    content = b"compressible payload\n" * 200
+    source = tmp_path / "source.bin"
+    source.write_bytes(content)
+    writes: list[bytes] = []
+    operations = []
+
+    async def stat_or_none(*_args, **_kwargs):
+        return None
+
+    async def write(_path, data, _name, append=False, create_parents=False):
+        writes.append(base64.b64decode(data))
+
+    async def stat(path, _name, checksum=False):
+        wire = b"".join(writes)
+        return {
+            "path": path,
+            "kind": "file",
+            "size": len(wire),
+            "sha256": hashlib.sha256(wire).hexdigest(),
+        }
+
+    async def operation(operation, payload, _name):
+        operations.append((operation, payload))
+        return {"size": len(content), "sha256": hashlib.sha256(content).hexdigest()}
+
+    async def no_op(*_args, **_kwargs):
+        return None
+
+    instance._remote_stat_or_none = stat_or_none
+    instance.filesystem_write = write
+    instance.filesystem_stat = stat
+    instance._remote_operation = operation
+    instance.filesystem_move = no_op
+    instance.filesystem_remove = no_op
+    result = asyncio.run(
+        instance.transfer_upload(
+            str(source), "/content/file", "runtime", compression="gzip", chunk_size=41
+        )
+    )
+    wire = b"".join(writes)
+    assert gzip.decompress(wire) == content
+    assert operations[0][0] == "fs_gzip_decompress"
+    assert operations[0][1]["expected_sha256"] == hashlib.sha256(content).hexdigest()
+    assert result["files_transferred"][0]["compression"] == "gzip"
+    assert result["wire_bytes"] < result["total_bytes"]
 
 
 def test_download_is_chunked_verified_and_atomic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -737,6 +791,101 @@ def test_download_is_chunked_verified_and_atomic(tmp_path: Path, monkeypatch: py
     assert destination.read_bytes() == content
     assert result["files_transferred"][0]["sha256"] == checksum
     assert not list(tmp_path.glob("*.colab-mcp-part-*"))
+
+
+def test_download_forced_gzip_streams_and_verifies_original(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    content = b"remote payload\n" * 200
+    wire = gzip.compress(content, mtime=0)
+    checksum = hashlib.sha256(content).hexdigest()
+    wire_checksum = hashlib.sha256(wire).hexdigest()
+    removed = []
+
+    async def remote_files(*_args):
+        item = {"path": "/content/source.bin", "kind": "file", "size": len(content)}
+        return item, [item]
+
+    async def stat(*_args, **_kwargs):
+        return {"sha256": checksum}
+
+    async def operation(operation, _payload, _name):
+        assert operation == "fs_gzip_compress"
+        return {"size": len(wire), "sha256": wire_checksum}
+
+    async def read(_path, _name, offset=0, limit=262_144):
+        data = wire[offset : offset + limit]
+        return {
+            "data_base64": base64.b64encode(data).decode(),
+            "next_offset": offset + len(data),
+            "eof": offset + len(data) == len(wire),
+        }
+
+    async def remove(path, *_args, **_kwargs):
+        removed.append(path)
+
+    instance._remote_files = remote_files
+    instance.filesystem_stat = stat
+    instance._remote_operation = operation
+    instance.filesystem_read = read
+    instance.filesystem_remove = remove
+    destination = tmp_path / "download.bin"
+    result = asyncio.run(
+        instance.transfer_download(
+            "/content/source.bin", str(destination), "runtime", compression="gzip", chunk_size=37
+        )
+    )
+    assert destination.read_bytes() == content
+    assert result["files_transferred"][0]["compression"] == "gzip"
+    assert result["wire_bytes"] == len(wire)
+    assert removed and removed[0].endswith(".gz")
+
+
+def test_download_corrupt_gzip_cleans_partial_and_remote_temp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    content = b"expected content" * 20
+    wire = b"not a gzip stream"
+    removed = []
+
+    async def remote_files(*_args):
+        item = {"path": "/content/source.bin", "kind": "file", "size": len(content)}
+        return item, [item]
+
+    async def stat(*_args, **_kwargs):
+        return {"sha256": hashlib.sha256(content).hexdigest()}
+
+    async def operation(*_args, **_kwargs):
+        return {"size": len(wire), "sha256": hashlib.sha256(wire).hexdigest()}
+
+    async def read(_path, _name, offset=0, limit=262_144):
+        data = wire[offset : offset + limit]
+        return {
+            "data_base64": base64.b64encode(data).decode(),
+            "next_offset": offset + len(data),
+            "eof": offset + len(data) == len(wire),
+        }
+
+    async def remove(path, *_args, **_kwargs):
+        removed.append(path)
+
+    instance._remote_files = remote_files
+    instance.filesystem_stat = stat
+    instance._remote_operation = operation
+    instance.filesystem_read = read
+    instance.filesystem_remove = remove
+    destination = tmp_path / "download.bin"
+    with pytest.raises(zlib.error):
+        asyncio.run(
+            instance.transfer_download(
+                "/content/source.bin", str(destination), "runtime", compression="gzip"
+            )
+        )
+    assert not destination.exists()
+    assert not list(tmp_path.glob("*.colab-mcp-part-*"))
+    assert removed
 
 
 def test_transfer_bounds_and_overwrite_are_explicit(

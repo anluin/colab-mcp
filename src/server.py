@@ -65,6 +65,28 @@ MaxTotalBytes = Annotated[
 MaxFiles = Annotated[
     int, Field(ge=1, le=100_000, description="Hard file-count limit for a directory transfer.")
 ]
+CompressionMode = Annotated[
+    Literal["auto", "gzip", "none"],
+    Field(
+        description="Wire compression: auto uses gzip only when worthwhile; gzip forces it; none disables it."
+    ),
+]
+CompressionMinBytes = Annotated[
+    int,
+    Field(
+        ge=0,
+        le=10_000_000_000,
+        description="Auto mode only considers files at least this many content bytes; defaults to 1 MiB.",
+    ),
+]
+CompressionMinSavings = Annotated[
+    float,
+    Field(
+        ge=0,
+        lt=1,
+        description="Minimum fractional wire-byte saving required by auto mode; defaults to 0.10.",
+    ),
+]
 
 
 @asynccontextmanager
@@ -310,6 +332,9 @@ async def colab_process_export(
     chunk_size: ChunkSize = 524_288,
     max_total_bytes: MaxTotalBytes = 100_000_000,
     max_files: MaxFiles = 10_000,
+    compression: CompressionMode = "auto",
+    compression_min_bytes: CompressionMinBytes = 1_048_576,
+    compression_min_savings: CompressionMinSavings = 0.10,
 ) -> dict:
     """Atomically export completed-process files; hold the runtime on any failure."""
     return await manager.process_export(
@@ -322,6 +347,9 @@ async def colab_process_export(
         chunk_size,
         max_total_bytes,
         max_files,
+        compression,
+        compression_min_bytes,
+        compression_min_savings,
     )
 
 
@@ -434,6 +462,9 @@ async def colab_transfer_upload(
     chunk_size: ChunkSize = 524_288,
     max_total_bytes: MaxTotalBytes = 100_000_000,
     max_files: MaxFiles = 10_000,
+    compression: CompressionMode = "auto",
+    compression_min_bytes: CompressionMinBytes = 1_048_576,
+    compression_min_savings: CompressionMinSavings = 0.10,
 ) -> dict:
     """Upload a file/directory with staged chunks, SHA-256 verification, and sync skips."""
     return await manager.transfer_upload(
@@ -445,6 +476,9 @@ async def colab_transfer_upload(
         chunk_size,
         max_total_bytes,
         max_files,
+        compression,
+        compression_min_bytes,
+        compression_min_savings,
     )
 
 
@@ -474,6 +508,9 @@ async def colab_transfer_download(
     chunk_size: ChunkSize = 524_288,
     max_total_bytes: MaxTotalBytes = 100_000_000,
     max_files: MaxFiles = 10_000,
+    compression: CompressionMode = "auto",
+    compression_min_bytes: CompressionMinBytes = 1_048_576,
+    compression_min_savings: CompressionMinSavings = 0.10,
 ) -> dict:
     """Download a file/directory with bounded chunks, SHA-256, and atomic publication."""
     return await manager.transfer_download(
@@ -485,6 +522,9 @@ async def colab_transfer_download(
         chunk_size,
         max_total_bytes,
         max_files,
+        compression,
+        compression_min_bytes,
+        compression_min_savings,
     )
 
 

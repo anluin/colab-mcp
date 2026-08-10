@@ -163,7 +163,8 @@ locally without reconnecting to the replacement backend.
 
 `colab_process_start` can also persist `export_on_exit` rules. Each rule names one runtime path,
 one local destination, the matching `exit_codes` (`null` means every code; omitted means `[0]`),
-whether an existing destination file may be replaced, and bounded transfer limits. A local
+whether an existing destination file may be replaced, and bounded transfer limits. A rule may
+also set `compression`, `compression_min_bytes`, and `compression_min_savings`. A local
 background watcher polls the owned process independently of agent requests, atomically downloads
 matching artifacts as soon as
 the process exits, retries interrupted exports with backoff, and resumes from the process journal
@@ -179,7 +180,8 @@ status/list results for `watching`, `degraded`, `completed`, or `held` and per-r
       "remote_path": "/content/result.tar.gz",
       "local_path": "./artifacts/result.tar.gz",
       "exit_codes": [0],
-      "overwrite": false
+      "overwrite": false,
+      "compression": "auto"
     },
     {
       "remote_path": "/content/failure.log",
@@ -219,6 +221,12 @@ destination file. Defaults cap a call at 100 MB, 10,000 files, and 512 KB per ch
 with the same SHA-256 are skipped when `sync=true`; differing destinations require
 `overwrite=true`. Uploads stage under a unique runtime path and downloads stage beside the local
 destination. A failed call removes its partial file before returning an error.
+Transfers use per-file gzip on the wire by default when a file is at least 1 MiB and its measured
+compressed representation is at least 10% smaller. Set `compression="gzip"` to force gzip or
+`compression="none"` to send original bytes. Compression is streamed, original and wire SHA-256
+values are verified, and results distinguish logical `total_bytes` from `wire_bytes` and report the
+actual codec per file. Directories remain independently resumable files rather than one archive;
+already-compressed or high-entropy files therefore stay uncompressed in `auto` mode.
 The shorter `colab_upload` and `colab_download` names are compatibility aliases for the same bounded,
 verified implementation; they do not bypass its limits.
 

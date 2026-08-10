@@ -26,6 +26,8 @@ runtimes are ephemeral execution environments.
 - Overwrite, append, recursive deletion, stale-record removal, and orphan release are explicit.
 - Transfers verify the owned allocation lease before remote access. Process export holds the
   runtime on every failure, and release after export requires `release_on_success=true`.
+- Compressed transfers enforce declared original sizes, total transfer limits, exact decompressed
+  lengths, and SHA-256 checks before publication; malformed or expanding gzip data is discarded.
 - Auto-export destinations are explicit host paths persisted in owner-only process state. Rules are
   capped, destinations must be unique, publication stays atomic, and automatic release is forbidden.
 - New endpoint ownership is persisted before preflight so cleanup failures remain discoverable.

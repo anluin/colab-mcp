@@ -79,6 +79,15 @@ backoff while the MCP server remains alive; restarting the server recreates unfi
 `held` means the process/runtime state was lost before export and requires human or agent recovery.
 An unmatched exit-code rule is recorded as `skipped`, not as an error.
 
+## Compression is not reducing transfer size
+
+`compression="auto"` intentionally sends small or poorly compressible files unchanged. Inspect
+each result's `compression`, `content_bytes`, `wire_bytes`, and `wire_ratio`. Lower
+`compression_min_bytes` or `compression_min_savings` only when extra CPU and staging space are
+worthwhile, or use `compression="gzip"` to force it. A gzip decode, size, or checksum error leaves
+the destination unpublished and removes transfer staging files; retry after confirming the runtime
+lease and source file are stable.
+
 ## GPU differs from the request
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,

@@ -51,6 +51,11 @@ have been sent, only idempotent operations are eligible for retry.
 Transfers begin with repeated upstream assignment observations, keep-alive refreshes, and a remote
 incarnation check. Individual filesystem calls retain their own incarnation guard, so stabilization
 does not weaken fail-fast runtime replacement detection during a transfer.
+Wire compression is a transport concern inside those transfer primitives. Each eligible file is
+gzip-compressed into a unique staging object, transferred in bounded chunks, and decompressed into
+a second staging object before atomic publication. Both wire bytes and original content are
+size/checksum verified. `auto` chooses compression from measured savings, so file semantics and
+directory layout never change and incompressible data does not pay network expansion.
 
 Completed-process export is a local publication transaction. Data is checksummed into a sibling
 staging path, renamed into visibility only after the complete transfer succeeds, and optionally

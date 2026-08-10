@@ -165,6 +165,7 @@ def build_remote_code(operation: str, payload: dict[str, Any]) -> str:
     return f"""
 import base64 as _cm_base64
 import datetime as _cm_datetime
+import gzip as _cm_gzip
 import hashlib as _cm_hashlib
 import json as _cm_json
 import os as _cm_os
@@ -411,6 +412,67 @@ try:
             finally:
                 _cm_temporary.unlink(missing_ok=True)
         _cm_result = {{**_cm_stat(_cm_target), 'bytes_written': len(_cm_data)}}
+    elif _cm_operation == 'fs_gzip_compress':
+        _cm_source = _cm_path(_cm_payload['source'])
+        _cm_destination = _cm_path(_cm_payload['destination'])
+        if not _cm_source.is_file():
+            raise FileNotFoundError(str(_cm_source))
+        _cm_max_input = int(_cm_payload['max_input_bytes'])
+        if _cm_source.stat().st_size > _cm_max_input:
+            raise ValueError('gzip source exceeds max_input_bytes')
+        _cm_destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with _cm_source.open('rb') as _cm_input, _cm_gzip.open(
+                    _cm_destination, 'wb', compresslevel=6) as _cm_output:
+                _cm_shutil.copyfileobj(_cm_input, _cm_output, length=1024 * 1024)
+            _cm_digest = _cm_hashlib.sha256()
+            with _cm_destination.open('rb') as _cm_handle:
+                for _cm_chunk in iter(lambda: _cm_handle.read(1024 * 1024), b''):
+                    _cm_digest.update(_cm_chunk)
+            _cm_result = {{
+                **_cm_stat(_cm_destination),
+                'sha256': _cm_digest.hexdigest(),
+                'content_bytes': _cm_source.stat().st_size,
+            }}
+        except BaseException:
+            _cm_destination.unlink(missing_ok=True)
+            raise
+    elif _cm_operation == 'fs_gzip_decompress':
+        _cm_source = _cm_path(_cm_payload['source'])
+        _cm_destination = _cm_path(_cm_payload['destination'])
+        if not _cm_source.is_file():
+            raise FileNotFoundError(str(_cm_source))
+        _cm_expected_size = int(_cm_payload['expected_size'])
+        _cm_max_output = int(_cm_payload['max_output_bytes'])
+        if _cm_expected_size > _cm_max_output:
+            raise ValueError('expected gzip output exceeds max_output_bytes')
+        _cm_destination.parent.mkdir(parents=True, exist_ok=True)
+        _cm_digest = _cm_hashlib.sha256()
+        _cm_written = 0
+        try:
+            with _cm_gzip.open(_cm_source, 'rb') as _cm_input, _cm_destination.open('wb') as _cm_output:
+                while True:
+                    _cm_chunk = _cm_input.read(1024 * 1024)
+                    if not _cm_chunk:
+                        break
+                    _cm_written += len(_cm_chunk)
+                    if _cm_written > _cm_max_output or _cm_written > _cm_expected_size:
+                        raise ValueError('gzip output exceeded declared size bound')
+                    _cm_digest.update(_cm_chunk)
+                    _cm_output.write(_cm_chunk)
+            if _cm_written != _cm_expected_size:
+                raise ValueError('gzip output size did not match expected_size')
+            if _cm_digest.hexdigest() != _cm_payload['expected_sha256']:
+                raise ValueError('gzip output checksum did not match expected_sha256')
+            _cm_result = {{
+                **_cm_stat(_cm_destination),
+                'sha256': _cm_digest.hexdigest(),
+                'content_bytes': _cm_written,
+                'wire_bytes': _cm_source.stat().st_size,
+            }}
+        except BaseException:
+            _cm_destination.unlink(missing_ok=True)
+            raise
     elif _cm_operation == 'fs_mkdir':
         _cm_target = _cm_path(_cm_payload['path'])
         _cm_target.mkdir(parents=bool(_cm_payload.get('parents')), exist_ok=bool(_cm_payload.get('exist_ok')))

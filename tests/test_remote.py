@@ -91,6 +91,8 @@ def test_process_output_reconciles_exit_count_with_live_spool_size():
         "fs_stat",
         "fs_read",
         "fs_write",
+        "fs_gzip_compress",
+        "fs_gzip_decompress",
         "fs_mkdir",
         "fs_move",
         "fs_remove",

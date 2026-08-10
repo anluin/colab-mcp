@@ -4,16 +4,19 @@ import asyncio
 import base64
 import contextlib
 import datetime
+import gzip
 import hashlib
 import json
 import logging
 import os
 import shutil
+import tempfile
 import threading
 import time
 import uuid
+import zlib
 from pathlib import Path, PurePosixPath
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 import jupyter_kernel_client
 import nbformat
@@ -88,6 +91,26 @@ class AutoExportRule(BaseModel):
             description="Hard directory file-count limit; defaults to 10,000.",
         ),
     ] = 10_000
+    compression: Annotated[
+        Literal["auto", "gzip", "none"],
+        Field(description="Wire compression: auto (default), forced gzip, or none."),
+    ] = "auto"
+    compression_min_bytes: Annotated[
+        int,
+        Field(
+            ge=0,
+            le=10_000_000_000,
+            description="Auto mode only considers files at least this large; defaults to 1 MiB.",
+        ),
+    ] = 1_048_576
+    compression_min_savings: Annotated[
+        float,
+        Field(
+            ge=0,
+            lt=1,
+            description="Minimum fractional wire-byte saving required in auto mode; defaults to 0.10.",
+        ),
+    ] = 0.10
 
     @field_validator("remote_path", "local_path")
     @classmethod
@@ -224,6 +247,44 @@ def _transfer_bounds(chunk_size: int, max_total_bytes: int, max_files: int) -> N
         raise ValueError("max_total_bytes must be between 1 and 10000000000")
     if not 1 <= max_files <= 100_000:
         raise ValueError("max_files must be between 1 and 100000")
+
+
+def _compression_settings(
+    compression: str, compression_min_bytes: int, compression_min_savings: float
+) -> tuple[str, int, float]:
+    if compression not in {"auto", "gzip", "none"}:
+        raise ValueError("compression must be auto, gzip, or none")
+    if not 0 <= compression_min_bytes <= 10_000_000_000:
+        raise ValueError("compression_min_bytes must be between 0 and 10000000000")
+    if not 0 <= compression_min_savings < 1:
+        raise ValueError("compression_min_savings must be at least 0 and less than 1")
+    return compression, compression_min_bytes, compression_min_savings
+
+
+def _gzip_local_file(source: Path) -> tuple[Path, int, str]:
+    descriptor, temporary_name = tempfile.mkstemp(prefix="colab-mcp-gzip-", suffix=".gz")
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with source.open("rb") as input_handle, temporary.open("wb") as raw_output:
+            with gzip.GzipFile(
+                filename="", mode="wb", fileobj=raw_output, compresslevel=6, mtime=0
+            ) as output_handle:
+                shutil.copyfileobj(input_handle, output_handle, length=1024 * 1024)
+        return temporary, temporary.stat().st_size, _file_sha256(temporary)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def _use_compressed_wire(
+    mode: str, content_bytes: int, wire_bytes: int, minimum_savings: float
+) -> bool:
+    return mode == "gzip" or (
+        mode == "auto"
+        and wire_bytes < content_bytes
+        and (content_bytes - wire_bytes) / max(1, content_bytes) >= minimum_savings
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -530,6 +591,9 @@ class ColabManager:
                     "chunk_size": rule.chunk_size,
                     "max_total_bytes": rule.max_total_bytes,
                     "max_files": rule.max_files,
+                    "compression": rule.compression,
+                    "compression_min_bytes": rule.compression_min_bytes,
+                    "compression_min_savings": rule.compression_min_savings,
                 }
             )
         return normalized
@@ -616,6 +680,9 @@ class ColabManager:
                         chunk_size=int(rule.get("chunk_size", 524_288)),
                         max_total_bytes=int(rule.get("max_total_bytes", 100_000_000)),
                         max_files=int(rule.get("max_files", 10_000)),
+                        compression=str(rule.get("compression", "auto")),
+                        compression_min_bytes=int(rule.get("compression_min_bytes", 1_048_576)),
+                        compression_min_savings=float(rule.get("compression_min_savings", 0.10)),
                     )
                 except asyncio.CancelledError:
                     raise
@@ -630,6 +697,8 @@ class ColabManager:
                         "status": "exported",
                         "local_path": exported.get("local_path"),
                         "total_bytes": transfer.get("total_bytes"),
+                        "wire_bytes": transfer.get("wire_bytes"),
+                        "compression": transfer.get("compression"),
                         "files_transferred": len(transfer.get("files_transferred") or []),
                         "files_skipped": len(transfer.get("files_skipped") or []),
                     }
@@ -1343,9 +1412,15 @@ class ColabManager:
         chunk_size: int = 524_288,
         max_total_bytes: int = 100_000_000,
         max_files: int = 10_000,
+        compression: str = "auto",
+        compression_min_bytes: int = 1_048_576,
+        compression_min_savings: float = 0.10,
     ) -> dict[str, Any]:
         """Upload files through staged, checksummed runtime filesystem writes."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
+        compression, compression_min_bytes, compression_min_savings = _compression_settings(
+            compression, compression_min_bytes, compression_min_savings
+        )
         source = Path(local_path).expanduser().resolve()
         if not source.exists() or (not source.is_file() and not source.is_dir()):
             raise ValueError(f"Local file or directory does not exist: {source}")
@@ -1381,16 +1456,40 @@ class ColabManager:
                 continue
             if existing and not overwrite:
                 raise FileExistsError(f"Remote destination exists: {destination}")
-            temporary = destination + ".colab-mcp-part-" + uuid.uuid4().hex
-            first = True
+            transfer_id = uuid.uuid4().hex
+            wire_temporary = destination + ".colab-mcp-wire-" + transfer_id
+            content_temporary = destination + ".colab-mcp-part-" + transfer_id
+            local_compressed: Path | None = None
             try:
-                with source_file.open("rb") as handle:
+                content_bytes = source_file.stat().st_size
+                wire_source = source_file
+                wire_bytes = content_bytes
+                wire_checksum = checksum
+                codec = "none"
+                if compression == "gzip" or (
+                    compression == "auto" and content_bytes >= compression_min_bytes
+                ):
+                    candidate, candidate_bytes, candidate_checksum = await asyncio.to_thread(
+                        _gzip_local_file, source_file
+                    )
+                    if _use_compressed_wire(
+                        compression, content_bytes, candidate_bytes, compression_min_savings
+                    ):
+                        local_compressed = candidate
+                        wire_source = candidate
+                        wire_bytes = candidate_bytes
+                        wire_checksum = candidate_checksum
+                        codec = "gzip"
+                    else:
+                        candidate.unlink(missing_ok=True)
+                first = True
+                with wire_source.open("rb") as handle:
                     while True:
                         chunk = handle.read(chunk_size)
                         if not chunk and not first:
                             break
                         await self.filesystem_write(
-                            temporary,
+                            wire_temporary,
                             base64.b64encode(chunk).decode(),
                             name,
                             append=not first,
@@ -1399,24 +1498,51 @@ class ColabManager:
                         first = False
                         if not chunk:
                             break
-                remote_stat = await self.filesystem_stat(temporary, name, checksum=True)
-                if remote_stat.get("sha256") != checksum:
-                    raise RuntimeError(f"Checksum mismatch while uploading {source_file}")
-                await self.filesystem_move(temporary, destination, name, overwrite=overwrite)
+                remote_stat = await self.filesystem_stat(wire_temporary, name, checksum=True)
+                if remote_stat.get("sha256") != wire_checksum:
+                    raise RuntimeError(f"Wire checksum mismatch while uploading {source_file}")
+                publication_source = wire_temporary
+                if codec == "gzip":
+                    await self._remote_operation(
+                        "fs_gzip_decompress",
+                        {
+                            "source": wire_temporary,
+                            "destination": content_temporary,
+                            "expected_size": content_bytes,
+                            "expected_sha256": checksum,
+                            "max_output_bytes": max_total_bytes,
+                        },
+                        name,
+                    )
+                    publication_source = content_temporary
+                await self.filesystem_move(
+                    publication_source, destination, name, overwrite=overwrite
+                )
                 transferred.append(
                     {
                         "local_path": str(source_file),
                         "remote_path": destination,
-                        "size": source_file.stat().st_size,
+                        "size": content_bytes,
                         "sha256": checksum,
+                        "compression": codec,
+                        "content_bytes": content_bytes,
+                        "wire_bytes": wire_bytes,
+                        "wire_sha256": wire_checksum,
+                        "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
                     }
                 )
             finally:
-                await self.filesystem_remove(temporary, name, missing_ok=True)
+                if local_compressed is not None:
+                    local_compressed.unlink(missing_ok=True)
+                await self.filesystem_remove(wire_temporary, name, missing_ok=True)
+                await self.filesystem_remove(content_temporary, name, missing_ok=True)
+        wire_total = sum(int(item["wire_bytes"]) for item in transferred)
         return {
             "files_transferred": transferred,
             "files_skipped": skipped,
             "total_bytes": total,
+            "wire_bytes": wire_total,
+            "compression": compression,
             "lease": lease,
         }
 
@@ -1451,9 +1577,15 @@ class ColabManager:
         chunk_size: int = 524_288,
         max_total_bytes: int = 100_000_000,
         max_files: int = 10_000,
+        compression: str = "auto",
+        compression_min_bytes: int = 1_048_576,
+        compression_min_savings: float = 0.10,
     ) -> dict[str, Any]:
         """Download files through checksummed chunks and atomic local replacement."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
+        compression, compression_min_bytes, compression_min_savings = _compression_settings(
+            compression, compression_min_bytes, compression_min_savings
+        )
         lease = await self.allocation_probe(name)
         root, files = await self._remote_files(remote_path, name, max_files)
         total = sum(int(item["size"]) for item in files)
@@ -1506,16 +1638,70 @@ class ColabManager:
             temporary = destination.with_name(
                 destination.name + ".colab-mcp-part-" + uuid.uuid4().hex
             )
+            remote_compressed: str | None = None
             try:
+                content_bytes = int(item["size"])
+                wire_path = item["path"]
+                wire_bytes = content_bytes
+                wire_checksum = checksum
+                codec = "none"
+                if compression == "gzip" or (
+                    compression == "auto" and content_bytes >= compression_min_bytes
+                ):
+                    remote_compressed = "/content/.colab-mcp/transfers/" + uuid.uuid4().hex + ".gz"
+                    candidate = await self._remote_operation(
+                        "fs_gzip_compress",
+                        {
+                            "source": item["path"],
+                            "destination": remote_compressed,
+                            "max_input_bytes": max_total_bytes,
+                        },
+                        name,
+                    )
+                    candidate_bytes = int(candidate["size"])
+                    if _use_compressed_wire(
+                        compression, content_bytes, candidate_bytes, compression_min_savings
+                    ):
+                        wire_path = remote_compressed
+                        wire_bytes = candidate_bytes
+                        wire_checksum = candidate["sha256"]
+                        codec = "gzip"
+                    else:
+                        await self.filesystem_remove(remote_compressed, name, missing_ok=True)
+                        remote_compressed = None
                 offset = 0
+                content_written = 0
+                wire_digest = hashlib.sha256()
+                content_digest = hashlib.sha256()
+                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if codec == "gzip" else None
                 with temporary.open("wb") as handle:
                     while True:
-                        chunk = await self.filesystem_read(item["path"], name, offset, chunk_size)
-                        handle.write(base64.b64decode(chunk["data_base64"], validate=True))
+                        chunk = await self.filesystem_read(wire_path, name, offset, chunk_size)
+                        wire_data = base64.b64decode(chunk["data_base64"], validate=True)
+                        wire_digest.update(wire_data)
+                        content_data = (
+                            decompressor.decompress(wire_data) if decompressor else wire_data
+                        )
+                        content_written += len(content_data)
+                        if content_written > content_bytes or content_written > max_total_bytes:
+                            raise RuntimeError("Decompressed transfer exceeded declared size bound")
+                        content_digest.update(content_data)
+                        handle.write(content_data)
                         offset = chunk["next_offset"]
                         if chunk["eof"]:
                             break
-                if await asyncio.to_thread(_file_sha256, temporary) != checksum:
+                    if decompressor:
+                        final_data = decompressor.flush()
+                        content_written += len(final_data)
+                        if content_written > content_bytes or content_written > max_total_bytes:
+                            raise RuntimeError("Decompressed transfer exceeded declared size bound")
+                        content_digest.update(final_data)
+                        handle.write(final_data)
+                        if not decompressor.eof:
+                            raise RuntimeError("Compressed transfer ended before the gzip stream")
+                if offset != wire_bytes or wire_digest.hexdigest() != wire_checksum:
+                    raise RuntimeError(f"Wire checksum mismatch while downloading {item['path']}")
+                if content_written != content_bytes or content_digest.hexdigest() != checksum:
                     raise RuntimeError(f"Checksum mismatch while downloading {item['path']}")
                 temporary.replace(destination)
                 transferred.append(
@@ -1524,14 +1710,24 @@ class ColabManager:
                         "local_path": str(destination),
                         "size": item["size"],
                         "sha256": checksum,
+                        "compression": codec,
+                        "content_bytes": content_bytes,
+                        "wire_bytes": wire_bytes,
+                        "wire_sha256": wire_checksum,
+                        "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
                     }
                 )
             finally:
                 temporary.unlink(missing_ok=True)
+                if remote_compressed is not None:
+                    await self.filesystem_remove(remote_compressed, name, missing_ok=True)
+        wire_total = sum(int(item["wire_bytes"]) for item in transferred)
         return {
             "files_transferred": transferred,
             "files_skipped": skipped,
             "total_bytes": total,
+            "wire_bytes": wire_total,
+            "compression": compression,
             "lease": lease,
         }
 
@@ -1546,6 +1742,9 @@ class ColabManager:
         chunk_size: int = 524_288,
         max_total_bytes: int = 100_000_000,
         max_files: int = 10_000,
+        compression: str = "auto",
+        compression_min_bytes: int = 1_048_576,
+        compression_min_savings: float = 0.10,
     ) -> dict[str, Any]:
         """Atomically publish completed-process output locally, or retain its runtime."""
         session = self.resolve(name)
@@ -1584,6 +1783,9 @@ class ColabManager:
                 chunk_size=chunk_size,
                 max_total_bytes=max_total_bytes,
                 max_files=max_files,
+                compression=compression,
+                compression_min_bytes=compression_min_bytes,
+                compression_min_savings=compression_min_savings,
             )
             staged.replace(destination)
             for item in transfer["files_transferred"]:
