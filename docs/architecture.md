@@ -15,6 +15,11 @@ non-interactive server to control ephemeral Colab assignments.
    layer coupled to Colab's published client implementation and should be upgraded deliberately
    with live validation.
 
+`colab_adapter.py` isolates one pinned-client timeout gap: reconnect construction otherwise performs
+an unconfigurable 30-second HTTP model refresh before the public start timeout applies. The bounded
+manager subclass forwards the critical-operation timeout to that existing-kernel lookup. No other
+module imports the upstream HTTP manager internals.
+
 Session ownership is persisted in the configured state directory. Process ownership is persisted
 inside its assigned runtime. Releasing the assignment is the lifecycle boundary: `/content`,
 processes, and runtime metadata are ephemeral. Notebook execution is an adapter over Python/kernel
@@ -71,6 +76,9 @@ directory layout never change and incompressible data does not pay network expan
 Completed-process export is a local publication transaction. Data is checksummed into a sibling
 staging path, renamed into visibility only after the complete transfer succeeds, and optionally
 followed by explicit runtime release. Every failure path preserves the tracked assignment for retry.
+The stage name is deterministic from process ownership and both paths. Completed files survive
+interruption and are checksum-skipped on retry, including after server restart. Publication removes
+the stage; failure journals a recoverable export record, while explicit cleanup is a separate tool.
 
 Optional process auto-export rules are journaled with process ownership. In-memory watchers only
 schedule work; their source of truth is the owner-only journal, so server startup can recreate them.

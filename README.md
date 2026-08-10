@@ -256,6 +256,12 @@ runtime tracked. `release_on_success=false` is the safe default; setting it to t
 only after publication succeeds. Atomic overwrite of an existing directory is intentionally
 unsupported across platforms—export to a new destination instead.
 
+The sibling stage is deterministic for the process, remote path, and local destination. A retry
+reuses it and checksum-skips files already completed, so multi-file exports resume at file
+granularity across MCP restarts. Failed results include a `recoverable_export` record and preserve
+the stage; successful publication removes it. `colab_process_export_cleanup` explicitly discards a
+stage that will not be resumed.
+
 ### Crash recovery and orphan cleanup
 
 Allocated endpoints are persisted before runtime preflight, so even a double failure during startup
@@ -311,6 +317,21 @@ uv run twine check dist/*
 ```
 
 CI runs on Ubuntu, macOS, and Windows with Python 3.12. The live integration has also been verified against a real Tesla T4: allocation, CUDA execution, notebook execution, pause/release, fresh-runtime resume, rerun, and cleanup with zero assignments remaining.
+
+The opt-in durability acceptance harness reproduces the large Windows/Codex workload with either
+accelerator. Defaults deliberately consume about five minutes of runtime and transfer two verified
+copies of twenty 1.9 MB checkpoint files, so run it only when that quota use is intended:
+
+```powershell
+uv run python scripts/live_acceptance.py --accelerator T4
+uv run python scripts/live_acceptance.py --accelerator L4
+```
+
+It performs a three-observation lease probe, guarded CUDA check, 63 KiB and incompressible 1.9 MB
+uploads with progress, durable process start, manager/server-lifespan restart, watcher recovery,
+automatic export, SHA-256 verification, and a second atomic export with `release_on_success=true`.
+Every phase is a named `--fail-after` injection boundary; cleanup in `finally` reacquires persisted
+ownership after the simulated server stop before releasing the assignment.
 
 The Google Colab integration version is pinned to the live-tested release. This project imports its portable client components; it does not invoke the platform-limited CLI executable.
 

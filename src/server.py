@@ -51,8 +51,8 @@ ChunkSize = Annotated[
     int,
     Field(
         ge=1,
-        le=1_000_000,
-        description="Transfer chunk size in bytes; 1-1,000,000. Defaults to 524,288.",
+        le=2_000_000,
+        description="Transfer chunk size in bytes; 1-2,000,000. Defaults to 524,288.",
     ),
 ]
 MaxTotalBytes = Annotated[
@@ -360,6 +360,17 @@ async def colab_process_export(
         compression_min_bytes,
         compression_min_savings,
     )
+
+
+@mcp.tool()
+async def colab_process_export_cleanup(
+    process_id: ProcessId,
+    remote_path: RemotePath,
+    local_path: LocalPath,
+    session: SessionSelector = None,
+) -> dict:
+    """Explicitly discard the deterministic local stage for a recoverable process export."""
+    return await manager.process_export_cleanup(process_id, remote_path, local_path, session)
 
 
 @mcp.tool()

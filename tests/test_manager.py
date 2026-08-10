@@ -686,7 +686,7 @@ def test_request_timeout_is_classified_as_submission_outcome_unknown(tmp_path, m
         def stop(self, shutdown_kernel=False):
             pass
 
-    monkeypatch.setattr("src.manager.jupyter_kernel_client.ColabKernelClient", TimeoutKernel)
+    monkeypatch.setattr("src.manager.kernel_client", TimeoutKernel)
     with pytest.raises(RequestOutcomeUnknownError) as caught:
         asyncio.run(instance.execute("print('x')", "runtime", 1, connection_attempts=1))
     assert caught.value.code == "operation_timed_out_submission_outcome_unknown"
@@ -717,9 +717,7 @@ def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest
             self.stopped = True
 
     kernel = FakeKernel()
-    monkeypatch.setattr(
-        "src.manager.jupyter_kernel_client.ColabKernelClient", lambda **_kwargs: kernel
-    )
+    monkeypatch.setattr("src.manager.kernel_client", lambda **_kwargs: kernel)
     with pytest.raises(RequestOutcomeUnknownError) as caught:
         asyncio.run(instance.execute_python("print('hello')", "runtime"))
     assert caught.value.code == "request_submission_outcome_unknown_response_lost"
@@ -755,12 +753,45 @@ def test_kernel_connection_failure_retries_before_user_code_is_sent(
             raise OSError("proxy unavailable before send")
         return FakeKernel()
 
-    monkeypatch.setattr("src.manager.jupyter_kernel_client.ColabKernelClient", kernel_factory)
+    monkeypatch.setattr("src.manager.kernel_client", kernel_factory)
     outputs = asyncio.run(instance.execute_python("print('once')", "runtime"))
     assert outputs == [{"output_type": "stream", "text": "ok\n"}]
     assert len(attempts) == 2
     assert user_code == ["print('once')"]
     assert instance.store.get("runtime").kernel_id == "new-kernel"
+
+
+def test_kernel_connection_retry_never_clears_owned_incarnation_kernel_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.kernel_id = "owned-kernel"
+    instance.store.add(runtime)
+    received_ids = []
+
+    class FakeKernel:
+        id = "owned-kernel"
+
+        def start(self, timeout):
+            pass
+
+        def execute(self, code, timeout):
+            return {"outputs": [{"output_type": "stream", "text": "ok\n"}]}
+
+        def stop(self, shutdown_kernel=False):
+            pass
+
+    def kernel_factory(**kwargs):
+        received_ids.append(kwargs["kernel_id"])
+        if len(received_ids) == 1:
+            raise OSError("transient proxy failure")
+        return FakeKernel()
+
+    monkeypatch.setattr("src.manager.kernel_client", kernel_factory)
+    asyncio.run(instance.execute_python("print('ok')", "runtime"))
+    assert received_ids == ["owned-kernel", "owned-kernel"]
+    assert instance.store.get("runtime").kernel_id == "owned-kernel"
 
 
 def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -1163,7 +1194,7 @@ def test_process_export_atomically_publishes_then_explicitly_releases(
     assert not list(tmp_path.glob("*.colab-mcp-export-*"))
 
 
-def test_process_export_failure_holds_runtime_and_removes_staging(
+def test_process_export_failure_holds_runtime_and_preserves_recoverable_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     instance = manager(tmp_path, monkeypatch)
@@ -1193,7 +1224,84 @@ def test_process_export_failure_holds_runtime_and_removes_staging(
     assert result["disposition"] == "held"
     assert result["error"]["code"] == "export_failed_runtime_held"
     assert not destination.exists()
+    stages = list(tmp_path.glob("*.colab-mcp-export-*"))
+    assert len(stages) == 1
+    assert stages[0].read_bytes() == b"partial"
+    assert result["recoverable_export"]["staging_path"] == str(stages[0])
+    assert result["recoverable_export"]["staging_exists"] is True
+
+
+def test_process_export_retry_reuses_deterministic_stage_then_publishes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    calls = []
+
+    async def status(*_args):
+        return {"process_id": "process", "status": "exited", "exit_code": 0}
+
+    async def download(_remote, local, _name, **kwargs):
+        calls.append((local, kwargs))
+        stage = Path(local)
+        stage.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            (stage / "checkpoint-00.bin").write_bytes(b"first")
+            raise OSError("interrupted")
+        assert (stage / "checkpoint-00.bin").read_bytes() == b"first"
+        (stage / "checkpoint-01.bin").write_bytes(b"second")
+        return {
+            "files_transferred": [
+                {
+                    "remote_path": "/content/checkpoints/checkpoint-01.bin",
+                    "local_path": str(stage / "checkpoint-01.bin"),
+                }
+            ],
+            "files_skipped": [
+                {
+                    "remote_path": "/content/checkpoints/checkpoint-00.bin",
+                    "local_path": str(stage / "checkpoint-00.bin"),
+                }
+            ],
+            "total_bytes": 11,
+            "lease": {"status": "stable"},
+        }
+
+    instance.process_status = status
+    instance.transfer_download = download
+    destination = tmp_path / "published"
+    first = asyncio.run(
+        instance.process_export("process", "/content/checkpoints", str(destination), "runtime")
+    )
+    second = asyncio.run(
+        instance.process_export("process", "/content/checkpoints", str(destination), "runtime")
+    )
+    assert first["exported"] is False
+    assert second["exported"] is True
+    assert calls[0][0] == calls[1][0]
+    assert calls[1][1]["sync"] is True
+    assert (destination / "checkpoint-00.bin").read_bytes() == b"first"
+    assert (destination / "checkpoint-01.bin").read_bytes() == b"second"
     assert not list(tmp_path.glob("*.colab-mcp-export-*"))
+
+
+def test_process_export_cleanup_only_removes_owned_deterministic_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    instance.process_journal.update("runtime", {"process_id": "process", "status": "exited"})
+    destination = tmp_path / "published"
+    stage = instance._process_export_stage("process", "/content/checkpoints", destination.resolve())
+    stage.mkdir()
+    (stage / "partial").write_bytes(b"data")
+    result = asyncio.run(
+        instance.process_export_cleanup(
+            "process", "/content/checkpoints", str(destination), "runtime"
+        )
+    )
+    assert result["removed"] is True
+    assert not stage.exists()
 
 
 def test_process_export_holds_while_owned_process_is_running(tmp_path, monkeypatch):

@@ -35,6 +35,9 @@ runtimes are ephemeral execution environments.
   lengths, and SHA-256 checks before publication; malformed or expanding gzip data is discarded.
 - Auto-export destinations are explicit host paths persisted in owner-only process state. Rules are
   capped, destinations must be unique, publication stays atomic, and automatic release is forbidden.
+- Process-export stages are deterministically scoped to an owned process and explicit paths. Failed
+  stages are retained for recovery and can only be discarded through the ownership-checked cleanup
+  tool or normal host filesystem access.
 - New endpoint ownership is persisted before preflight so cleanup failures remain discoverable.
 - Random runtime-incarnation markers prevent operations from crossing into a recycled Colab
   backend that happens to reuse an endpoint or kernel connection.

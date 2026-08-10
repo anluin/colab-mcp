@@ -19,7 +19,6 @@ from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
-import jupyter_kernel_client
 import nbformat
 from colab_cli.auth import TOKEN_CONFIG_PATH, AuthProvider, get_credentials
 from colab_cli.client import Accelerator, Client, Prod, Variant
@@ -29,6 +28,7 @@ from google.oauth2.credentials import Credentials
 from nbformat.v4 import new_output
 from pydantic import BaseModel, Field, field_validator
 
+from .colab_adapter import kernel_client
 from .remote import (
     DEFAULT_OUTPUT_LIMIT,
     DEFAULT_PROCESS_OUTPUT_LIMIT,
@@ -46,6 +46,7 @@ from .remote import (
 
 GPU_TYPES = {"T4", "L4", "G4", "H100", "A100"}
 COMPUTE_UNITS_URL = "https://colab.research.google.com/signup"
+MAX_TRANSFER_CHUNK = 2_000_000
 logger = logging.getLogger("colab_mcp.manager")
 
 
@@ -72,7 +73,7 @@ class AutoExportRule(BaseModel):
         int,
         Field(
             ge=1,
-            le=1_000_000,
+            le=MAX_TRANSFER_CHUNK,
             description="Download chunk size in bytes; defaults to 524,288.",
         ),
     ] = 524_288
@@ -328,8 +329,8 @@ def _file_sha256(path: Path) -> str:
 
 
 def _transfer_bounds(chunk_size: int, max_total_bytes: int, max_files: int) -> None:
-    if not 1 <= chunk_size <= MAX_OUTPUT_LIMIT:
-        raise ValueError(f"chunk_size must be between 1 and {MAX_OUTPUT_LIMIT}")
+    if not 1 <= chunk_size <= MAX_TRANSFER_CHUNK:
+        raise ValueError(f"chunk_size must be between 1 and {MAX_TRANSFER_CHUNK}")
     if not 1 <= max_total_bytes <= 10_000_000_000:
         raise ValueError("max_total_bytes must be between 1 and 10000000000")
     if not 1 <= max_files <= 100_000:
@@ -794,6 +795,7 @@ class ColabManager:
                     results[rule_id] = {
                         "status": "degraded",
                         "error": exported.get("error"),
+                        "recoverable_export": exported.get("recoverable_export"),
                     }
             complete = not pending and all(
                 item.get("status") in {"exported", "skipped"} for item in results.values()
@@ -1012,7 +1014,8 @@ class ColabManager:
             attempt_timings: dict[str, Any] = {}
             try:
                 try:
-                    kernel = jupyter_kernel_client.ColabKernelClient(
+                    kernel = kernel_client(
+                        connection_timeout=connection_timeout,
                         server_url=session.url,
                         proxy_token=session.token,
                         kernel_id=session.kernel_id,
@@ -1110,10 +1113,9 @@ class ColabManager:
                 if attempt + 1 >= connection_attempts:
                     error.details["retries"] = attempt
                     raise
-                session.kernel_id = None
-                self.store.add(session)
                 logger.warning(
-                    "kernel_connection_retry session=%s operation_not_sent=true", session.name
+                    "kernel_connection_retry session=%s operation_not_sent=true preserve_kernel_id=true",
+                    session.name,
                 )
         raise AssertionError("unreachable")
 
@@ -1235,9 +1237,11 @@ class ColabManager:
                 }
                 if operation not in retryable:
                     raise
-                session.kernel_id = None
-                self.store.add(session)
-                logger.warning("kernel_reconnect_retry operation=%s session=%s", operation, name)
+                logger.warning(
+                    "kernel_reconnect_retry operation=%s session=%s preserve_kernel_id=true",
+                    operation,
+                    name,
+                )
                 if lease_token:
                     outputs = await self.execute(
                         code,
@@ -2331,6 +2335,34 @@ class ColabManager:
             },
         }
 
+    @staticmethod
+    def _process_export_stage(process_id: str, remote_path: str, destination: Path) -> Path:
+        identity = hashlib.sha256(
+            f"{process_id}\0{remote_path}\0{destination}".encode()
+        ).hexdigest()[:32]
+        return destination.with_name(destination.name + ".colab-mcp-export-" + identity)
+
+    async def process_export_cleanup(
+        self, process_id: str, remote_path: str, local_path: str, name: str | None
+    ) -> dict[str, Any]:
+        """Discard only the deterministic local stage for one owned process export."""
+        session = self.resolve(name)
+        if self.process_journal.get(session.name, process_id) is None:
+            raise ValueError(f"Unknown owned process_id: {process_id}")
+        destination = Path(local_path).expanduser().resolve()
+        staged = self._process_export_stage(process_id, remote_path, destination)
+        existed = staged.exists()
+        if staged.is_dir():
+            shutil.rmtree(staged)
+        else:
+            staged.unlink(missing_ok=True)
+        return {
+            "process_id": process_id,
+            "session": session.name,
+            "staging_path": str(staged),
+            "removed": existed,
+        }
+
     async def process_export(
         self,
         process_id: str,
@@ -2365,8 +2397,9 @@ class ColabManager:
 
         destination = Path(local_path).expanduser().resolve()
         destination.parent.mkdir(parents=True, exist_ok=True)
-        staged = destination.with_name(destination.name + ".colab-mcp-export-" + uuid.uuid4().hex)
+        staged = self._process_export_stage(process_id, remote_path, destination)
         transfer: dict[str, Any] | None = None
+        published = False
         try:
             if destination.exists() and not overwrite:
                 raise FileExistsError(f"Local destination exists: {destination}")
@@ -2379,7 +2412,7 @@ class ColabManager:
                 str(staged),
                 session.name,
                 overwrite=False,
-                sync=False,
+                sync=True,
                 chunk_size=chunk_size,
                 max_total_bytes=max_total_bytes,
                 max_files=max_files,
@@ -2388,6 +2421,7 @@ class ColabManager:
                 compression_min_savings=compression_min_savings,
             )
             staged.replace(destination)
+            published = True
             for item in transfer["files_transferred"]:
                 staged_item = Path(item["local_path"])
                 relative = staged_item.relative_to(staged) if staged_item != staged else None
@@ -2404,13 +2438,20 @@ class ColabManager:
                 "disposition": "held",
                 "runtime_released": False,
                 "error": {"code": "export_failed_runtime_held", "message": str(error)},
+                "recoverable_export": {
+                    "staging_path": str(staged),
+                    "staging_exists": staged.exists(),
+                    "resume": "Retry colab_process_export with the same process, paths, and limits.",
+                    "cleanup": "Use colab_process_export_cleanup to explicitly discard staging.",
+                },
                 "last_known_process": status,
             }
         finally:
-            if staged.is_dir():
-                shutil.rmtree(staged, ignore_errors=True)
-            else:
-                staged.unlink(missing_ok=True)
+            if published:
+                if staged.is_dir():
+                    shutil.rmtree(staged, ignore_errors=True)
+                else:
+                    staged.unlink(missing_ok=True)
 
         result = {
             "process_id": process_id,

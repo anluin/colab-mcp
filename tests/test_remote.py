@@ -499,7 +499,7 @@ def test_read_only_remote_operation_reconnects_kernel_once(tmp_path, monkeypatch
     )
     assert result == {"path": "/content/file"}
     assert len(calls) == 2
-    assert instance.store.get("runtime").kernel_id is None
+    assert instance.store.get("runtime").kernel_id == "stale-kernel"
 
 
 def test_mutating_remote_operation_is_never_retried(tmp_path, monkeypatch):

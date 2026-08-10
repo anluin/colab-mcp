@@ -288,7 +288,7 @@ try:
         _cm_target = _cm_path(_cm_payload['path'])
         _cm_offset = int(_cm_payload['offset'])
         _cm_data = _cm_base64.b64decode(_cm_payload['data_base64'], validate=True)
-        if _cm_offset < 0 or len(_cm_data) > 1000000:
+        if _cm_offset < 0 or len(_cm_data) > 2000000:
             raise ValueError('invalid transfer chunk bounds')
         _cm_target.parent.mkdir(parents=True, exist_ok=True)
         _cm_current_size = _cm_target.stat().st_size if _cm_target.is_file() else 0

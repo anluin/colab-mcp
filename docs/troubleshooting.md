@@ -83,6 +83,9 @@ or an unexpected remote staging mutation.
 If `colab_process_export` returns `disposition="held"`, the runtime remains tracked. Correct the
 reported status, destination, transfer, or release error and retry. A successfully published local
 artifact is retained even when the subsequent explicit release fails.
+When `recoverable_export.staging_exists=true`, retry with identical process/remote/local paths and
+limits; completed files are checksum-skipped. Use `colab_process_export_cleanup` only when you intend
+to discard that recovery state. Cleanup never releases the runtime.
 
 For automatic exports, inspect `auto_export.results` through `colab_process_status` or
 `colab_process_list`. `degraded` means at least one matching rule failed and will be retried with

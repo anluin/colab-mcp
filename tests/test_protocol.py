@@ -27,6 +27,8 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_start",
                     "colab_run_command",
                     "colab_process_export",
+                    "colab_process_export_cleanup",
+                    "colab_transfer_cleanup",
                     "colab_allocation_probe",
                     "colab_keepalive",
                     "colab_stop",
