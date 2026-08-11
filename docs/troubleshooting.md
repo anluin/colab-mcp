@@ -59,12 +59,13 @@ Prefer `colab_process_start` for long work. Poll status and output, and signal i
 reclaimed runtime cannot be resumed; allocate a fresh one and restore files/checkpoints. Always
 download durable results before releasing compute.
 
-Idempotent read/status/introspection calls reconnect once after a kernel-channel timeout. If Colab
-then returns a terminal proxy error such as HTTP 502 while creating the replacement kernel, the
-assignment is not recoverable through a supported client operation. Do not retry mutations whose
-outcome is unknown. Reconcile/stop the assignment, allocate a fresh runtime, and restore previously
-downloaded data. Download important results before notebook or other kernel-intensive work when
-possible.
+The server reuses a verified kernel channel and sends a harmless preflight before each requested
+operation. If connection or preflight fails, caller code was not submitted: the server closes the
+channel, rechecks the same lease/assignment where applicable, and reconnects once. This is safe even
+for a mutation such as process start. If Colab then returns a terminal proxy error such as HTTP 502,
+the assignment is not recoverable through a supported client operation. A failure after the caller's
+execute call begins has unknown outcome and is never automatically retried; reconcile through
+process status or checksums first. Download important results before kernel-intensive work.
 
 ## Transfer lease probe fails
 
@@ -117,12 +118,12 @@ clients should expose both descriptions to the agent; if a client hides server
 instructions, the tool descriptions remain sufficient for the immediate next action.
 # Lease-bound transfer cannot connect
 
-`colab_transfer_download` reads and offset-checked `colab_transfer_upload` chunks each
-automatically retry one
-`kernel_connection_failed_request_not_submitted` failure after confirming that the same
-assignment and lease are still owned. Connection setup has a 21-second local wall-clock
-deadline for the configured 20-second upstream timeout. The lease is not invalidated by
-this safe pre-submission failure. If both attempts fail, keep the lease token and retry the
-download while it remains unexpired; call `colab_allocation_probe` again only after expiry.
+All operations automatically retry one
+`kernel_connection_failed_request_not_submitted` failure after confirming that the same assignment
+and lease are still owned. Connection setup has a 21-second local wall-clock deadline for the
+configured 20-second upstream timeout; a reused healthy channel normally reports zero connection
+seconds. The lease is not invalidated by this safe pre-submission failure. If both attempts fail,
+keep the lease token and retry the operation while it remains unexpired; call
+`colab_allocation_probe` again only after expiry.
 The remote fingerprint guard still runs inside the first successfully submitted request, so
 the retry never follows a recycled backend.

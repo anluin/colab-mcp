@@ -197,6 +197,10 @@ separate assignment lookup, kernel connection, kernel preflight, local output pr
 and total duration. The upstream kernel client combines request submission, remote execution, and
 output retrieval into one synchronous interval, which is reported honestly as a combined phase.
 The remote fingerprint/lease guard duration is measured inside the same request.
+Kernel channels are cached per runtime and reused across tool calls; timing attempts expose
+`kernel_connection_reused`. A harmless preflight validates a cached channel before caller code is
+sent. Confirmed pre-submission connection failures reconnect and retry once without consuming the
+operation lease, including for process start. Unknown post-submission outcomes are never retried.
 Every command is runtime-owned and receives a `process_id`. The timeout is only how long the MCP
 call waits: if it expires, `process_continues=true` and the command remains alive for later
 status/output/signal calls. Termination is always explicit. Python/Jupyter output is bounded to
@@ -228,6 +232,8 @@ avoid a new probe. Critical remote requests validate the token and fingerprint i
 request before mutation, so the operation cannot follow a replacement runtime. Omitting the token
 performs a fresh probe. Assignment lookup is bounded to five seconds and reports
 `assignment_no_longer_exists` or `assignment_lookup_timed_out` separately.
+Probe observations do not wait for Colab's slow Tunnel Frontend heartbeat endpoint; the existing
+background keepalive continues independently and the result reports `heartbeat="background"`.
 
 Uploads emit MCP progress after every durable chunk with phase, bytes, total, chunk number, and
 elapsed time. A failed upload reports its `transfer_id`, deterministic `staging_path`, known staged

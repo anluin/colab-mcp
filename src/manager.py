@@ -474,10 +474,56 @@ class ColabManager:
         self.auth_provider = AuthProvider(os.environ.get("COLAB_MCP_AUTH", "oauth2"))
         self.oauth_config = os.environ.get("COLAB_MCP_OAUTH_CONFIG")
         self._client: Client | None = None
+        # Keep one live Jupyter channel per owned runtime.  The upstream Colab
+        # runtime object does the same: reconnecting for every MCP request is
+        # both slow and substantially more failure-prone on the runtime proxy.
+        self._kernel_clients: dict[str, Any] = {}
+        self._kernel_locks: dict[str, asyncio.Lock] = {}
+        self._kernel_clients_guard = threading.Lock()
         self._keepalives: dict[str, asyncio.Task] = {}
         self.keepalive_seconds = int(os.environ.get("COLAB_MCP_KEEPALIVE_SECONDS", "60"))
         self._export_watchers: dict[tuple[str, str], asyncio.Task] = {}
         self.export_poll_seconds = float(os.environ.get("COLAB_MCP_EXPORT_POLL_SECONDS", "5"))
+
+    def _kernel_lock(self, name: str) -> asyncio.Lock:
+        with self._kernel_clients_guard:
+            return self._kernel_locks.setdefault(name, asyncio.Lock())
+
+    def _cached_kernel(self, name: str) -> Any | None:
+        with self._kernel_clients_guard:
+            return self._kernel_clients.get(name)
+
+    def _cache_kernel(self, name: str, kernel: Any) -> None:
+        with self._kernel_clients_guard:
+            self._kernel_clients[name] = kernel
+
+    async def close_kernel_channel(self, name: str) -> None:
+        """Close a local channel without shutting down the remote Colab kernel."""
+        async with self._kernel_lock(name):
+            await self._close_kernel_channel_unlocked(name)
+
+    async def _close_kernel_channel_unlocked(self, name: str) -> None:
+        with self._kernel_clients_guard:
+            kernel = self._kernel_clients.pop(name, None)
+        if kernel is not None:
+            await asyncio.to_thread(self._stop_kernel_safely, kernel)
+
+    @staticmethod
+    def _stop_kernel_safely(kernel: Any) -> None:
+        with contextlib.suppress(Exception):
+            kernel.stop(shutdown_kernel=False)
+
+    async def shutdown_kernel_channels(self) -> None:
+        """Close all local channels while preserving tracked runtime ownership."""
+        with self._kernel_clients_guard:
+            kernels = list(self._kernel_clients.values())
+            self._kernel_clients.clear()
+            self._kernel_locks.clear()
+        if kernels:
+            await asyncio.gather(
+                *(asyncio.to_thread(self._stop_kernel_safely, kernel) for kernel in kernels),
+                return_exceptions=True,
+            )
 
     def _read_suspended(self) -> dict[str, dict[str, Any]]:
         with self._suspended_lock:
@@ -967,6 +1013,7 @@ class ColabManager:
                 task = self._keepalives.pop(item["session"], None)
                 if task:
                     task.cancel()
+                await self.close_kernel_channel(item["session"])
                 self.store.remove(item["session"])
                 self.process_journal.remove_session(item["session"])
                 forgotten.append(item["session"])
@@ -1015,7 +1062,26 @@ class ColabManager:
             # during circular package initialization on Windows.
             connection_started = time.monotonic()
             attempt_timings: dict[str, Any] = {}
+            kernel = self._cached_kernel(session.name)
+            reused = kernel is not None
             try:
+                if reused:
+                    assert kernel is not None
+                    # A harmless request verifies the cached websocket before the
+                    # caller's operation is submitted.  Failure here is therefore
+                    # always safe to reconnect and retry, including process_start.
+                    preflight_started = time.monotonic()
+                    kernel.execute("import os; os.chdir('/content')", timeout=connection_timeout)
+                    attempt_timings.update(
+                        {
+                            "kernel_connection_seconds": 0.0,
+                            "kernel_connection_reused": True,
+                            "kernel_preflight_seconds": round(
+                                time.monotonic() - preflight_started, 3
+                            ),
+                        }
+                    )
+                    return kernel, attempt_timings
                 kernel = kernel_client(
                     connection_timeout=connection_timeout,
                     server_url=session.url,
@@ -1027,6 +1093,7 @@ class ColabManager:
                 attempt_timings["kernel_connection_seconds"] = round(
                     time.monotonic() - connection_started, 3
                 )
+                attempt_timings["kernel_connection_reused"] = False
                 if not session.kernel_id and kernel.id:
                     session.kernel_id = kernel.id
                     self.store.add(session)
@@ -1042,8 +1109,14 @@ class ColabManager:
                 attempt_timings["kernel_preflight_seconds"] = round(
                     time.monotonic() - preflight_started, 3
                 )
+                self._cache_kernel(session.name, kernel)
                 return kernel, attempt_timings
             except Exception as error:
+                if kernel is not None:
+                    self._stop_kernel_safely(kernel)
+                with self._kernel_clients_guard:
+                    if self._kernel_clients.get(session.name) is kernel:
+                        self._kernel_clients.pop(session.name, None)
                 raise KernelConnectionError(
                     "Kernel connection failed before the requested operation was sent",
                     {
@@ -1081,9 +1154,6 @@ class ColabManager:
                         "elapsed_seconds": round(time.monotonic() - request_started, 3),
                     },
                 ) from error
-            finally:
-                with contextlib.suppress(Exception):
-                    kernel.stop(shutdown_kernel=False)
             attempt_timings["request_submission_to_output_retrieval_seconds"] = round(
                 time.monotonic() - request_started, 3
             )
@@ -1093,59 +1163,65 @@ class ColabManager:
         if connection_attempts not in {1, 2}:
             raise ValueError("connection_attempts must be 1 or 2")
         attempts: list[dict[str, Any]] = []
-        for attempt in range(connection_attempts):
-            connection_abandoned = threading.Event()
-            try:
-                # Upstream connection setup spans HTTP model lookup, websocket startup,
-                # and a preflight request. Some layers ignore their nominal timeout, so
-                # enforce one bounded deadline around the complete pre-submission phase.
+        async with self._kernel_lock(session.name):
+            for attempt in range(connection_attempts):
+                connection_abandoned = threading.Event()
                 try:
-                    kernel, attempt_timing = await asyncio.wait_for(
-                        asyncio.to_thread(connect, connection_abandoned),
-                        timeout=connection_timeout + 1,
-                    )
-                except TimeoutError as error:
-                    connection_abandoned.set()
-                    raise KernelConnectionError(
-                        "Kernel connection exceeded the bounded local deadline before submission",
-                        {
-                            "kernel_connection_seconds": round(connection_timeout + 1, 3),
-                            "connection_timeout_seconds": connection_timeout,
-                            "local_deadline_seconds": connection_timeout + 1,
+                    # Upstream connection setup spans HTTP model lookup, websocket startup,
+                    # and a preflight request. Some layers ignore their nominal timeout, so
+                    # enforce one bounded deadline around the complete pre-submission phase.
+                    try:
+                        kernel, attempt_timing = await asyncio.wait_for(
+                            asyncio.to_thread(connect, connection_abandoned),
+                            timeout=connection_timeout + 1,
+                        )
+                    except TimeoutError as error:
+                        connection_abandoned.set()
+                        await self._close_kernel_channel_unlocked(session.name)
+                        raise KernelConnectionError(
+                            "Kernel connection exceeded the bounded local deadline before submission",
+                            {
+                                "kernel_connection_seconds": round(connection_timeout + 1, 3),
+                                "connection_timeout_seconds": connection_timeout,
+                                "local_deadline_seconds": connection_timeout + 1,
+                            },
+                        ) from error
+                    try:
+                        raw_outputs, attempt_timing = await asyncio.to_thread(
+                            submit, kernel, attempt_timing
+                        )
+                    except BaseException:
+                        await self._close_kernel_channel_unlocked(session.name)
+                        raise
+                    attempts.append({"attempt": attempt + 1, **attempt_timing})
+                    output_started = time.monotonic()
+                    outputs = _bound_outputs(_json_safe(raw_outputs), output_limit)
+                    output_processing_seconds = round(time.monotonic() - output_started, 3)
+                    return {
+                        "outputs": outputs,
+                        "timings": {
+                            "assignment_lookup_seconds": None,
+                            "fingerprint_validation_seconds": None,
+                            "attempts": attempts,
+                            "retries": attempt,
+                            "retry_backoff_seconds": 0.0,
+                            "local_output_processing_seconds": output_processing_seconds,
+                            "total_seconds": round(time.monotonic() - overall_started, 3),
+                            "upstream_limitation": (
+                                "The pinned kernel client exposes submission, remote execution, and "
+                                "I/O collection as one synchronous interval. That combined interval is "
+                                "reported without inventing a split."
+                            ),
                         },
-                    ) from error
-                raw_outputs, attempt_timing = await asyncio.to_thread(
-                    submit, kernel, attempt_timing
-                )
-                attempts.append({"attempt": attempt + 1, **attempt_timing})
-                output_started = time.monotonic()
-                outputs = _bound_outputs(_json_safe(raw_outputs), output_limit)
-                output_processing_seconds = round(time.monotonic() - output_started, 3)
-                return {
-                    "outputs": outputs,
-                    "timings": {
-                        "assignment_lookup_seconds": None,
-                        "fingerprint_validation_seconds": None,
-                        "attempts": attempts,
-                        "retries": attempt,
-                        "retry_backoff_seconds": 0.0,
-                        "local_output_processing_seconds": output_processing_seconds,
-                        "total_seconds": round(time.monotonic() - overall_started, 3),
-                        "upstream_limitation": (
-                            "The pinned kernel client exposes submission, remote execution, and "
-                            "I/O collection as one synchronous interval. That combined interval is "
-                            "reported without inventing a split."
-                        ),
-                    },
-                }
-            except KernelConnectionError as error:
-                if attempt + 1 >= connection_attempts:
-                    error.details["retries"] = attempt
-                    raise
-                logger.warning(
-                    "kernel_connection_retry session=%s operation_not_sent=true preserve_kernel_id=true",
-                    session.name,
-                )
+                    }
+                except KernelConnectionError as error:
+                    if attempt + 1 >= connection_attempts:
+                        error.details["retries"] = attempt
+                        raise
+                    logger.warning(
+                        "kernel_connection_retry session=%s operation_not_sent=true preserve_kernel_id=true",
+                        session.name,
+                    )
         raise AssertionError("unreachable")
 
     async def execute(
@@ -1253,7 +1329,27 @@ class ColabManager:
                     )
                 else:
                     outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-            except (KernelConnectionError, TimeoutError, OSError):
+            except KernelConnectionError:
+                # Connection/preflight failed before this operation was sent. It is
+                # safe to retry every operation with the same lease and fingerprint.
+                logger.warning(
+                    "kernel_reconnect_retry operation=%s session=%s operation_not_sent=true",
+                    operation,
+                    name,
+                )
+                if lease_token:
+                    await self._operation_lease(session.name, lease_token)
+                    outputs = await self.execute(
+                        code,
+                        name,
+                        timeout,
+                        output_limit=3_000_000,
+                        connection_timeout=LEASED_CONNECTION_TIMEOUT_SECONDS,
+                        connection_attempts=1,
+                    )
+                else:
+                    outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
+            except (TimeoutError, OSError):
                 retryable = {
                     "process_status",
                     "process_list",
@@ -1293,6 +1389,7 @@ class ColabManager:
                     outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
             return parse_remote_result(outputs)
         except RuntimeReplacedError as error:
+            await self.close_kernel_channel(session.name)
             session.runtime_replaced_at = datetime.datetime.now(datetime.UTC).isoformat()
             session.runtime_replaced_reason = str(error)
             self.store.add(session)
@@ -1324,7 +1421,6 @@ class ColabManager:
                 raise RuntimeError(
                     "allocation_lease_lost: the tracked Colab assignment is no longer active"
                 )
-            await asyncio.to_thread(self.client().keep_alive_assignment, session.endpoint)
             observed.append(session.endpoint)
             if index + 1 < observations and interval:
                 await asyncio.sleep(interval)
@@ -1352,6 +1448,7 @@ class ColabManager:
             "observed_at": incarnation["observed_at"],
             "lease_token": lease_token,
             "lease_expires_at": expires_at.isoformat(),
+            "heartbeat": "background",
         }
 
     def _validate_operation_lease(self, session: SessionState, lease_token: str) -> None:
@@ -2561,6 +2658,7 @@ class ColabManager:
         task = self._keepalives.pop(session.name, None)
         if task:
             task.cancel()
+        await self.close_kernel_channel(session.name)
         assignments = await asyncio.to_thread(self.client().list_assignments)
         was_active = session.endpoint in {item.endpoint for item in assignments}
         if was_active:

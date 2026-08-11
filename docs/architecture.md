@@ -38,21 +38,28 @@ The server does not expose a network listener. MCP request boundaries do not bou
 lifetime; detached process state and output are polled in later requests. A runner continuously
 drains both output pipes, retains each stream only up to its configured cap, and records truncation
 and total byte counts without stopping the workload.
-Server shutdown does not silently terminate remotely running work. Local keep-alive tasks end with
-the event loop, while persisted assignment/process metadata enables a new server instance to
-reconnect. Compute release remains explicit and auditable.
+Server shutdown does not silently terminate remotely running work. Local keep-alive tasks and
+cached kernel channels end with the event loop, while persisted assignment/process metadata enables
+a new server instance to reconnect. Closing a channel never shuts down the remote kernel. Compute
+release remains explicit and auditable.
 
 The server lifespan restores background keep-alive tasks for assignments that still exist upstream.
 Each task uses the pinned CLI client's Tunnel Frontend ping, records observable health in session
 state, retries transient failures, and stops when repeated failures are confirmed as a lost lease.
-Graceful shutdown cancels only local heartbeat tasks and never releases compute implicitly.
-If a kernel channel cannot connect before submission, safe operations reconnect once while
-preserving the owned kernel identity, lease, and fingerprint. Once code may have been sent,
-ambiguous outcomes are never automatically retried. Arbitrary code is never duplicated.
+Graceful shutdown cancels local heartbeat tasks, closes local kernel channels, and never releases
+compute implicitly. A verified channel is reused across MCP requests for the same session and each
+request first sends a harmless `/content` preflight. This avoids repeated model lookup and websocket
+startup while detecting a dead cached connection before the caller's operation is submitted.
+Operations for one runtime are serialized because the Jupyter channel is sequential; different
+runtimes remain independent. A confirmed connection/preflight failure reconnects once for every
+operation, including mutations, while preserving the owned kernel identity, lease, and fingerprint.
+Once caller code may have been sent, ambiguous outcomes are never automatically retried.
 
-Transfers begin with repeated upstream assignment observations, keep-alive refreshes, and a remote
-incarnation check. Individual filesystem calls retain their own incarnation guard, so stabilization
-does not weaken fail-fast runtime replacement detection during a transfer.
+Transfers begin with repeated upstream assignment observations and a remote incarnation check. The
+probe relies on the session's existing background heartbeat instead of synchronously waiting on the
+Tunnel Frontend heartbeat for every observation. Individual filesystem calls retain their own
+incarnation guard, so stabilization does not weaken fail-fast runtime replacement detection during
+a transfer.
 The probe also publishes a random operation lease into that incarnation and persists only the
 current token locally. Critical tools accept the opaque token. The generated remote request checks
 the incarnation and lease before entering its operation branch; this closes the probe-to-mutation

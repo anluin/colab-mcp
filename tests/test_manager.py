@@ -618,7 +618,31 @@ def test_allocation_probe_observes_owned_lease_and_runtime_incarnation(tmp_path,
     assert result["runtime_fingerprint"] == "a" * 32
     assert len(result["lease_token"]) == 32
     assert instance.store.get("runtime").operation_lease_token == result["lease_token"]
-    assert keepalives == ["endpoint", "endpoint", "endpoint"]
+    assert keepalives == []
+    assert result["heartbeat"] == "background"
+
+
+def test_allocation_probe_does_not_block_on_slow_keepalive_endpoint(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+
+    class FakeClient:
+        def list_assignments(self):
+            return [SimpleNamespace(endpoint="endpoint")]
+
+        def keep_alive_assignment(self, _endpoint):
+            raise AssertionError("probe must use the existing background heartbeat")
+
+    async def remote(*_args, **_kwargs):
+        return {
+            "runtime_fingerprint": "a" * 32,
+            "observed_at": "2026-08-10T00:00:00+00:00",
+        }
+
+    instance.client = lambda: FakeClient()
+    instance._remote_operation = remote
+    result = asyncio.run(ColabManager.allocation_probe(instance, "runtime", interval=0))
+    assert result["status"] == "stable"
 
 
 def test_allocation_probe_fails_before_remote_access_when_lease_is_lost(tmp_path, monkeypatch):
@@ -763,6 +787,92 @@ def test_kernel_failure_always_closes_client(tmp_path: Path, monkeypatch: pytest
     assert kernel.stopped is True
 
 
+def test_successive_tools_reuse_one_verified_kernel_channel(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    created = []
+
+    class FakeKernel:
+        id = "kernel"
+
+        def __init__(self):
+            self.started = 0
+            self.stopped = 0
+            self.executed = []
+
+        def start(self, timeout):
+            self.started += 1
+
+        def execute(self, code, timeout):
+            self.executed.append(code)
+            return {"outputs": [{"output_type": "stream", "text": "ok\n"}]}
+
+        def stop(self, shutdown_kernel=False):
+            self.stopped += 1
+
+    def factory(**_kwargs):
+        kernel = FakeKernel()
+        created.append(kernel)
+        return kernel
+
+    monkeypatch.setattr("src.manager.kernel_client", factory)
+    first = asyncio.run(instance._execute_detailed("first", "runtime", 10))
+    second = asyncio.run(instance._execute_detailed("second", "runtime", 10))
+
+    assert len(created) == 1
+    assert created[0].started == 1
+    assert created[0].stopped == 0
+    assert created[0].executed == [
+        "import os; os.makedirs('/content', exist_ok=True); os.chdir('/content')",
+        "first",
+        "import os; os.chdir('/content')",
+        "second",
+    ]
+    assert first["timings"]["attempts"][0]["kernel_connection_reused"] is False
+    assert second["timings"]["attempts"][0]["kernel_connection_reused"] is True
+    asyncio.run(instance.shutdown_kernel_channels())
+    assert created[0].stopped == 1
+
+
+def test_cached_channel_preflight_failure_reconnects_before_user_code(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    instance.store.add(session("runtime", "endpoint"))
+    created = []
+    user_code = []
+
+    class FakeKernel:
+        id = "kernel"
+
+        def __init__(self, fail_later=False):
+            self.fail_later = fail_later
+            self.calls = 0
+
+        def start(self, timeout):
+            pass
+
+        def execute(self, code, timeout):
+            self.calls += 1
+            if self.fail_later and self.calls == 3:
+                raise OSError("cached websocket ended")
+            if not code.startswith("import os;"):
+                user_code.append(code)
+            return {"outputs": []}
+
+        def stop(self, shutdown_kernel=False):
+            pass
+
+    def factory(**_kwargs):
+        kernel = FakeKernel(fail_later=not created)
+        created.append(kernel)
+        return kernel
+
+    monkeypatch.setattr("src.manager.kernel_client", factory)
+    asyncio.run(instance.execute("first", "runtime", 10))
+    asyncio.run(instance.execute("second", "runtime", 10))
+    assert len(created) == 2
+    assert user_code == ["first", "second"]
+
+
 def test_kernel_connection_failure_retries_before_user_code_is_sent(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -877,6 +987,46 @@ def test_lease_bound_download_retries_pre_submission_failure_without_replacing_l
     assert attempts == 2
     assert lease_checks == [("runtime", "b" * 32)]
     assert instance.store.get("runtime").operation_lease_token == "b" * 32
+
+
+def test_process_start_retries_when_connection_failed_before_submission(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    attempts = 0
+    lease_checks = []
+
+    async def execute(*_args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise KernelConnectionError("proxy unavailable before send")
+        return [
+            {
+                "output_type": "stream",
+                "text": '__COLAB_MCP_RESULT__{"ok":true,"result":{"process_id":"p1"}}\n',
+            }
+        ]
+
+    async def preserve_lease(name, token):
+        lease_checks.append((name, token))
+        return runtime, {"lease_token": token, "runtime_fingerprint": "a" * 32}
+
+    instance.execute = execute
+    instance._operation_lease = preserve_lease
+    result = asyncio.run(
+        instance._remote_operation(
+            "process_start",
+            {"argv": ["python", "job.py"]},
+            "runtime",
+            lease_token="b" * 32,
+        )
+    )
+    assert result == {"process_id": "p1"}
+    assert attempts == 2
+    assert lease_checks == [("runtime", "b" * 32)]
 
 
 def test_lease_bound_upload_chunk_retries_confirmed_pre_submission_failure(

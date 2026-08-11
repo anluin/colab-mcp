@@ -105,6 +105,7 @@ async def server_lifespan(_server: FastMCP):
         yield
     finally:
         await manager.shutdown_process_export_watchers()
+        await manager.shutdown_kernel_channels()
         await manager.shutdown_keepalives()
 
 
@@ -118,8 +119,9 @@ mcp = FastMCP(
         "Recovery contract: runtime_missing means the assignment ended; start a new "
         "session and restore durable inputs. runtime_replaced means Colab recycled the "
         "backend; never reuse its lease or assume /content/process state survived. "
-        "kernel_connection_failed/request_not_submitted are safe to retry only after a "
-        "fresh allocation probe confirms the same fingerprint. response_lost may have "
+        "kernel_connection_failed/request_not_submitted is retried once automatically after "
+        "the same lease/assignment is confirmed; if it persists, retry with that lease while valid. "
+        "response_lost may have "
         "executed remotely; inspect process/file state before retrying. operation_timeout "
         "does not imply cancellation; poll durable processes or signal them explicitly. "
         "quota_or_preemption requires releasing unused sessions and waiting or changing "
@@ -296,7 +298,7 @@ async def colab_process_start(
     ] = None,
     lease_token: LeaseToken = None,
 ) -> dict:
-    """Start durably under a lease. On connection loss retry only if request_not_submitted."""
+    """Start durably under a lease. request_not_submitted retries once automatically after lease validation; response_lost has unknown outcome, so list processes before retrying."""
     return await manager.process_start(
         argv, session, cwd, environment, output_limit, export_on_exit, lease_token
     )
@@ -558,7 +560,7 @@ async def colab_allocation_probe(
         float, Field(ge=0, le=5, description="Seconds between observations; defaults to 0.25.")
     ] = 0.25,
 ) -> dict:
-    """Issue an operation lease. Pass it immediately; if expired/mismatched, probe again, never follow replacement."""
+    """Issue an operation lease using fast assignment observations plus the existing background heartbeat. Pass it immediately; if expired/mismatched, probe again, never follow replacement."""
     return await manager.allocation_probe(session, observations, interval)
 
 
