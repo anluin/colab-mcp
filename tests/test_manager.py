@@ -847,7 +847,7 @@ def test_lease_bound_download_retries_pre_submission_failure_without_replacing_l
     async def execute(*_args, **kwargs):
         nonlocal attempts
         attempts += 1
-        assert kwargs["connection_timeout"] == 5
+        assert kwargs["connection_timeout"] == 20
         assert kwargs["connection_attempts"] == 1
         if attempts == 1:
             raise KernelConnectionError("proxy unavailable before send")
@@ -877,6 +877,48 @@ def test_lease_bound_download_retries_pre_submission_failure_without_replacing_l
     assert attempts == 2
     assert lease_checks == [("runtime", "b" * 32)]
     assert instance.store.get("runtime").operation_lease_token == "b" * 32
+
+
+def test_lease_bound_upload_chunk_retries_confirmed_pre_submission_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    attempts = 0
+
+    async def execute(*_args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs["connection_timeout"] == 20
+        assert kwargs["connection_attempts"] == 1
+        if attempts == 1:
+            raise KernelConnectionError("proxy unavailable before send")
+        return [
+            {
+                "output_type": "stream",
+                "text": '__COLAB_MCP_RESULT__{"ok":true,"result":{"offset":3}}\n',
+            }
+        ]
+
+    async def preserve_lease(name, token):
+        return runtime, {"lease_token": token, "runtime_fingerprint": "a" * 32}
+
+    instance.execute = execute
+    instance._operation_lease = preserve_lease
+    result = asyncio.run(
+        instance._remote_operation(
+            "transfer_upload_chunk",
+            {"path": "/content/file.part", "offset": 0, "data_base64": "YWJj"},
+            "runtime",
+            lease_token="b" * 32,
+        )
+    )
+
+    assert result == {"offset": 3}
+    assert attempts == 2
 
 
 def test_lease_bound_read_does_not_retry_unknown_submission_outcome(

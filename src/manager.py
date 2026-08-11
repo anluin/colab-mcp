@@ -47,6 +47,10 @@ from .remote import (
 GPU_TYPES = {"T4", "L4", "G4", "H100", "A100"}
 COMPUTE_UNITS_URL = "https://colab.research.google.com/signup"
 MAX_TRANSFER_CHUNK = 2_000_000
+# Colab's runtime proxy regularly needs more than five seconds to establish a
+# fresh websocket even when the allocation is healthy.  Keep the phase bounded,
+# but allow enough time for normal cross-region cold/reconnect latency.
+LEASED_CONNECTION_TIMEOUT_SECONDS = 20
 logger = logging.getLogger("colab_mcp.manager")
 
 
@@ -1197,7 +1201,7 @@ class ColabManager:
             session.name,
             timeout,
             output_limit,
-            connection_timeout=5,
+            connection_timeout=LEASED_CONNECTION_TIMEOUT_SECONDS,
             connection_attempts=1,
         )
         control_timings = _extract_control_timing(result["outputs"])
@@ -1244,7 +1248,7 @@ class ColabManager:
                         name,
                         timeout,
                         output_limit=3_000_000,
-                        connection_timeout=5,
+                        connection_timeout=LEASED_CONNECTION_TIMEOUT_SECONDS,
                         connection_attempts=1,
                     )
                 else:
@@ -1259,6 +1263,10 @@ class ColabManager:
                     "fs_read",
                     "inspect",
                     "lease_probe",
+                    # Offset-checked chunks are idempotent. A confirmed
+                    # pre-submission failure can safely reconnect and retry
+                    # with the same runtime lease and payload.
+                    "transfer_upload_chunk",
                 }
                 if operation not in retryable:
                     raise
@@ -1278,7 +1286,7 @@ class ColabManager:
                         name,
                         timeout,
                         output_limit=3_000_000,
-                        connection_timeout=5,
+                        connection_timeout=LEASED_CONNECTION_TIMEOUT_SECONDS,
                         connection_attempts=1,
                     )
                 else:
