@@ -11,7 +11,9 @@
       "env": {
         "COLAB_MCP_AUTH": "oauth2",
         "COLAB_MCP_KEEPALIVE_SECONDS": "60"
-      }
+      },
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 21600
     }
   }
 }
