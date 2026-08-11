@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Annotated, Literal
 
 from mcp.server.fastmcp import Context, FastMCP
@@ -124,7 +125,10 @@ mcp = FastMCP(
         "quota_or_preemption requires releasing unused sessions and waiting or changing "
         "account capacity. local_transport_failure requires restarting the MCP client; "
         "then use sessions/process_list to recover persisted ownership. Preserve returned "
-        "transfer_id, staging_path, process_id, next_offset, and recoverable_export fields."
+        "transfer_id, staging_path, process_id, next_offset, and recoverable_export fields. "
+        "If this connector is defective, use the colab-self-repair skill to patch "
+        "https://github.com/anluin/colab-mcp. GitHub access must use authenticated gh only; "
+        "when gh is missing, stop and ask the user whether to install it."
     ),
     lifespan=server_lifespan,
 )
@@ -142,6 +146,11 @@ async def colab_health() -> dict:
         "google_colab_cli_version": COLAB_CLI_VERSION,
         "transport": "stdio",
         "interactive_auth_allowed": False,
+        "self_repair": {
+            "repository": "https://github.com/anluin/colab-mcp",
+            "github_client": "gh-only",
+            "missing_gh": "Ask the user whether to install GitHub CLI; do not substitute.",
+        },
     }
 
 
@@ -384,7 +393,6 @@ async def colab_process_export_cleanup(
     return await manager.process_export_cleanup(process_id, remote_path, local_path, session)
 
 
-@mcp.tool()
 async def colab_fs_list(
     path: Annotated[
         str, Field(description="Runtime directory under /content; defaults to /content.")
@@ -396,7 +404,6 @@ async def colab_fs_list(
     return await manager.filesystem_list(path, session, limit)
 
 
-@mcp.tool()
 async def colab_fs_stat(
     path: RemotePath,
     session: SessionSelector = None,
@@ -408,7 +415,6 @@ async def colab_fs_stat(
     return await manager.filesystem_stat(path, session, checksum)
 
 
-@mcp.tool()
 async def colab_fs_read(
     path: RemotePath,
     session: SessionSelector = None,
@@ -421,7 +427,6 @@ async def colab_fs_read(
     return await manager.filesystem_read(path, session, offset, limit)
 
 
-@mcp.tool()
 async def colab_fs_write(
     path: RemotePath,
     data_base64: Annotated[
@@ -440,7 +445,6 @@ async def colab_fs_write(
     return await manager.filesystem_write(path, data_base64, session, append, create_parents)
 
 
-@mcp.tool()
 async def colab_fs_mkdir(
     path: RemotePath,
     session: SessionSelector = None,
@@ -455,7 +459,6 @@ async def colab_fs_mkdir(
     return await manager.filesystem_mkdir(path, session, parents, exist_ok)
 
 
-@mcp.tool()
 async def colab_fs_move(
     source: Annotated[str, Field(description="Existing source path under /content.")],
     destination: Annotated[str, Field(description="Destination path under /content.")],
@@ -466,7 +469,6 @@ async def colab_fs_move(
     return await manager.filesystem_move(source, destination, session, overwrite)
 
 
-@mcp.tool()
 async def colab_fs_remove(
     path: RemotePath,
     session: SessionSelector = None,
@@ -481,7 +483,6 @@ async def colab_fs_remove(
     return await manager.filesystem_remove(path, session, recursive, missing_ok)
 
 
-@mcp.tool()
 async def colab_transfer_upload(
     local_path: LocalPath,
     remote_path: RemotePath,
@@ -561,7 +562,6 @@ async def colab_allocation_probe(
     return await manager.allocation_probe(session, observations, interval)
 
 
-@mcp.tool()
 async def colab_transfer_download(
     remote_path: RemotePath,
     local_path: LocalPath,
@@ -608,7 +608,6 @@ async def colab_execute_notebook(
     return await manager.execute_notebook(source, output, session, cell_timeout)
 
 
-@mcp.tool()
 async def colab_upload(
     local_path: LocalPath, remote_path: RemotePath, session: SessionSelector = None
 ) -> dict:
@@ -616,7 +615,6 @@ async def colab_upload(
     return await manager.upload(local_path, remote_path, session)
 
 
-@mcp.tool()
 async def colab_download(
     remote_path: RemotePath, local_path: LocalPath, session: SessionSelector = None
 ) -> dict:
@@ -663,6 +661,91 @@ async def colab_resume_notebook(
 def colab_paused_notebooks() -> list[dict]:
     """List notebook checkpoints whose GPU runtimes were released."""
     return manager.suspended()
+
+
+@mcp.tool()
+async def colab_workspace_sync(
+    direction: Annotated[
+        Literal["push", "pull"],
+        Field(description="push copies local_folder to Colab; pull copies remote_folder locally."),
+    ],
+    local_folder: Annotated[
+        str, Field(description="Local directory tree. Push requires it to exist; pull creates it.")
+    ],
+    ctx: Context,
+    remote_folder: Annotated[
+        str,
+        Field(description="Remote directory tree under /content; use a dedicated workspace root."),
+    ] = "/content/workspace",
+    session: SessionSelector = None,
+    lease_token: LeaseToken = None,
+    chunk_size: ChunkSize = 2_000_000,
+    max_total_bytes: MaxTotalBytes = 1_000_000_000,
+    max_files: MaxFiles = 10_000,
+    compression: CompressionMode = "auto",
+) -> dict:
+    """Incrementally synchronize a folder tree using SHA-256, bounded chunks, compression, and atomic per-file publication. Unchanged files are skipped; extra destination files are never deleted. Retry with the same lease after confirmed pre-submission failure."""
+    local = Path(local_folder).expanduser().resolve()
+    if direction == "push" and not local.is_dir():
+        raise ValueError("local_folder must be an existing directory for push")
+    if lease_token is None:
+        lease_token = (await manager.allocation_probe(session))["lease_token"]
+    if direction == "push":
+
+        async def progress(event: dict) -> None:
+            await ctx.report_progress(
+                event["bytes_sent"],
+                event["total_bytes"],
+                json.dumps(event, separators=(",", ":")),
+            )
+
+        result = await manager.transfer_upload(
+            local_path=str(local),
+            remote_path=remote_folder,
+            name=session,
+            overwrite=True,
+            sync=True,
+            chunk_size=chunk_size,
+            max_total_bytes=max_total_bytes,
+            max_files=max_files,
+            compression=compression,
+            compression_min_bytes=1_048_576,
+            compression_min_savings=0.10,
+            lease_token=lease_token,
+            transfer_id=None,
+            progress=progress,
+        )
+    else:
+        selected, accepted = await manager._operation_lease(session, lease_token)
+        lease_token = accepted["lease_token"]
+        remote = await manager._remote_operation(
+            "fs_stat",
+            {"path": remote_folder, "checksum": False},
+            selected.name,
+            lease_token=lease_token,
+        )
+        if remote.get("kind") != "directory":
+            raise ValueError("remote_folder must be an existing directory for pull")
+        result = await manager.transfer_download(
+            remote_path=remote_folder,
+            local_path=str(local),
+            name=selected.name,
+            overwrite=True,
+            sync=True,
+            chunk_size=chunk_size,
+            max_total_bytes=max_total_bytes,
+            max_files=max_files,
+            compression=compression,
+            compression_min_bytes=1_048_576,
+            compression_min_savings=0.10,
+            lease_token=lease_token,
+        )
+    return {
+        "direction": direction,
+        "mode": "content_hash_incremental",
+        "deletes_destination_extras": False,
+        **result,
+    }
 
 
 @mcp.tool()

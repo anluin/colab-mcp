@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab Runtime Workflow"
+  short_description: "Run short and durable Colab workloads safely"
+  default_prompt: "Use $colab-runtime-workflow to run this workload on Colab with artifact recovery and cleanup."

@@ -1,0 +1,29 @@
+{
+  "name": "colab-mcp",
+  "version": "0.1.0",
+  "description": "Reliable ephemeral Google Colab compute with durable jobs and folder synchronization.",
+  "author": {
+    "name": "anluin",
+    "url": "https://github.com/anluin"
+  },
+  "homepage": "https://github.com/anluin/colab-mcp",
+  "repository": "https://github.com/anluin/colab-mcp",
+  "license": "Apache-2.0",
+  "keywords": ["google-colab", "gpu", "mcp", "remote-compute"],
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Colab MCP",
+    "shortDescription": "Reliable short and durable Colab compute",
+    "longDescription": "Run guarded jobs on ephemeral Colab runtimes, synchronize project folders, recover durable output, and clean up assignments.",
+    "developerName": "anluin",
+    "category": "Developer Tools",
+    "capabilities": ["Read", "Write"],
+    "websiteURL": "https://github.com/anluin/colab-mcp",
+    "defaultPrompt": [
+      "Run this workload on Colab and return verified artifacts.",
+      "Keep this local project folder synchronized with a Colab runtime.",
+      "Diagnose this colab-mcp problem and patch the GitHub repository if needed."
+    ]
+  }
+}

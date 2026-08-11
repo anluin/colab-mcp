@@ -29,12 +29,21 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_process_export",
                     "colab_process_export_cleanup",
                     "colab_transfer_cleanup",
+                    "colab_workspace_sync",
                     "colab_allocation_probe",
                     "colab_keepalive",
                     "colab_stop",
                 } <= names
                 assert not health.isError
                 assert not compute_units.isError
+                assert {
+                    "colab_fs_read",
+                    "colab_fs_write",
+                    "colab_upload",
+                    "colab_download",
+                    "colab_transfer_upload",
+                    "colab_transfer_download",
+                }.isdisjoint(names)
 
                 recovery_terms = {
                     "colab_sessions": "stale",
@@ -45,9 +54,8 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_process_start": "request_not_submitted",
                     "colab_process_output": "spool",
                     "colab_process_export": "retry",
-                    "colab_transfer_upload": "transfer_id",
                     "colab_allocation_probe": "never follow replacement",
-                    "colab_transfer_download": "sync=true",
+                    "colab_workspace_sync": "same lease",
                     "colab_stop": "permanently loses",
                 }
                 descriptions = {tool.name: tool.description or "" for tool in tools.tools}

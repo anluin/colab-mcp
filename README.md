@@ -98,8 +98,7 @@ uv --directory /absolute/path/to/colab-mcp run --locked colab-mcp serve
   timeouts, exit codes, separate stdout/stderr, and bounded output.
 - Start long-running processes without blocking an MCP request; list, inspect, incrementally read,
   interrupt, terminate, or kill them in later requests.
-- List, stat, checksum, chunk-read, atomic-write, append, create, move, and explicitly remove
-  files and directories within a runtime-owned `/content` boundary.
+- Synchronize complete project and artifact folders within a runtime-owned `/content` boundary.
 - Inspect OS, Python, CPU, RAM, disk, GPU/VRAM, CUDA/driver, requested tools, and a bounded process
   snapshot without assuming any workload or framework.
 - Transfer files or directory trees in bounded chunks with SHA-256 verification, incremental sync
@@ -113,11 +112,8 @@ uv --directory /absolute/path/to/colab-mcp run --locked colab-mcp serve
 Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`, `colab_keepalive`,
 `colab_run_command`, `colab_process_start`, `colab_process_status`, `colab_process_list`,
 `colab_process_output`, `colab_process_signal`, `colab_process_export`, `colab_execute`,
-`colab_execute_notebook`, `colab_allocation_probe`,
-`colab_fs_list`, `colab_fs_stat`, `colab_fs_read`, `colab_fs_write`, `colab_fs_mkdir`,
-`colab_fs_move`, `colab_fs_remove`,
-`colab_transfer_upload`, `colab_transfer_download`,
-`colab_upload`, `colab_download`, `colab_pause_notebook`, `colab_resume_notebook`,
+`colab_execute_notebook`, `colab_allocation_probe`, `colab_workspace_sync`,
+`colab_transfer_cleanup`, `colab_pause_notebook`, `colab_resume_notebook`,
 `colab_paused_notebooks`, `colab_reconcile`, `colab_stop`, and `colab_compute_units`.
 Use `colab_inspect` after allocation to discover the actual runtime rather than assuming that a
 requested accelerator, executable, or CUDA version is present.
@@ -214,26 +210,17 @@ complete byte count, including discarded bytes, and `total_bytes_final=true`.
 The handoff deadline is best-effort because each Colab kernel status/output round-trip has latency;
 it is not a hard real-time deadline.
 
-Filesystem reads and writes use base64 so both text and binary content round-trip without encoding
-ambiguity. Calls are limited to 1 MB; use offsets and append mode for larger files. Non-append writes
-replace atomically. Paths are resolved on the runtime and may not escape `/content`. Moving onto an
-existing path requires `overwrite=true`; removing a non-empty directory requires `recursive=true`.
-Use `checksum=true` with `colab_fs_stat` to verify a completed transfer.
-
-For host/runtime transfer, prefer `colab_transfer_upload` and `colab_transfer_download`. A directory
-path maps its contents beneath the destination directory; a file path maps directly to the given
-destination file. Defaults cap a call at 100 MB, 10,000 files, and 512 KB per chunk. Existing files
-with the same SHA-256 are skipped when `sync=true`; differing destinations require
-`overwrite=true`. Uploads stage under a unique runtime path and downloads stage beside the local
-destination. A failed call removes its partial file before returning an error.
+`colab_workspace_sync` is the only public general file-transfer tool. It accepts complete local and
+remote directory roots with `direction="push"` or `direction="pull"`. It skips identical SHA-256
+content, updates changed files through staging and atomic publication, and never deletes
+destination-only files. The underlying bounded transfer engine remains private so agents cannot
+shuttle individual bytes or mutate arbitrary runtime files through MCP.
 Transfers use per-file gzip on the wire by default when a file is at least 1 MiB and its measured
 compressed representation is at least 10% smaller. Set `compression="gzip"` to force gzip or
 `compression="none"` to send original bytes. Compression is streamed, original and wire SHA-256
 values are verified, and results distinguish logical `total_bytes` from `wire_bytes` and report the
 actual codec per file. Directories remain independently resumable files rather than one archive;
 already-compressed or high-entropy files therefore stay uncompressed in `auto` mode.
-The shorter `colab_upload` and `colab_download` names are compatibility aliases for the same bounded,
-verified implementation; they do not bypass its limits.
 
 `colab_allocation_probe` returns an opaque, one-hour `lease_token` bound to the tracked endpoint and
 runtime fingerprint both locally and inside that runtime. Pass it to a transfer or process start to
@@ -277,7 +264,7 @@ idempotent when a tracked runtime has already disappeared.
 1. Check `colab_health`.
 2. Start with a T4 unless another accelerator is required.
 3. Create or execute a notebook.
-4. Download important artifacts.
+4. Pull the complete artifact folder with `colab_workspace_sync`.
 5. Pause to checkpoint and release compute, or stop when finished.
 6. Always stop a runtime after an error if it was not already released.
 
@@ -289,7 +276,17 @@ RAM variables, ad-hoc package installs, and files left only in `/content` do not
 
 ## Compute units
 
-Google does not publish a supported API for reading the compute-unit balance of a personal Colab account. `colab_compute_units` returns this limitation and Google's official account-management URL. The server does not scrape undocumented browser endpoints.
+Google does not publish a supported API for reading the compute-unit balance of a personal Colab
+account. `colab_compute_units` returns this limitation and Google's official account-management URL.
+The server does not scrape undocumented browser endpoints.
+
+## Agent workflows and self-repair
+
+The Codex plugin includes focused skills for short/durable runtime operation, whole-folder sync,
+and connector repair. The repair workflow targets
+<https://github.com/anluin/colab-mcp> and uses GitHub CLI exclusively for GitHub network access. If
+`gh` is absent, the agent must stop and ask whether the user wants it installed; it must not silently
+substitute another downloader or API client.
 
 Free, Pro, Pro+, and Pay As You Go personal accounts are supported. Actual GPU models, runtime length, and compute usage remain controlled by Google Colab.
 

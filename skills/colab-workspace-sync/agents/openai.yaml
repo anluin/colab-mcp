@@ -1,0 +1,4 @@
+interface:
+  display_name: "Colab Workspace Sync"
+  short_description: "Synchronize project folders with Colab"
+  default_prompt: "Use $colab-workspace-sync to synchronize this project folder with Colab and preserve changed artifacts."

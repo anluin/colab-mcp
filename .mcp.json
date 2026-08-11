@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "colab": {
+      "command": "uvx",
+      "args": [
+        "--from",
+        "git+https://github.com/anluin/colab-mcp.git",
+        "colab-mcp",
+        "serve"
+      ],
+      "env": {
+        "COLAB_MCP_AUTH": "oauth2",
+        "COLAB_MCP_KEEPALIVE_SECONDS": "60"
+      }
+    }
+  }
+}

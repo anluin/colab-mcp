@@ -46,12 +46,9 @@ The server lifespan restores background keep-alive tasks for assignments that st
 Each task uses the pinned CLI client's Tunnel Frontend ping, records observable health in session
 state, retries transient failures, and stops when repeated failures are confirmed as a lost lease.
 Graceful shutdown cancels only local heartbeat tasks and never releases compute implicitly.
-If a kernel channel times out, idempotent status/read/list/introspection operations clear the stale
-kernel identity and reconnect once. Mutations and arbitrary code are never retried automatically
-because their outcome may be unknown and duplicate execution would be unsafe.
-Connection setup is tracked separately from execution: if setup fails before the requested code is
-sent, the client clears the stale kernel identity and retries once for any operation. Once code may
-have been sent, only idempotent operations are eligible for retry.
+If a kernel channel cannot connect before submission, safe operations reconnect once while
+preserving the owned kernel identity, lease, and fingerprint. Once code may have been sent,
+ambiguous outcomes are never automatically retried. Arbitrary code is never duplicated.
 
 Transfers begin with repeated upstream assignment observations, keep-alive refreshes, and a remote
 incarnation check. Individual filesystem calls retain their own incarnation guard, so stabilization
@@ -72,6 +69,10 @@ gzip-compressed into a unique staging object, transferred in bounded chunks, and
 a second staging object before atomic publication. Both wire bytes and original content are
 size/checksum verified. `auto` chooses compression from measured savings, so file semantics and
 directory layout never change and incompressible data does not pay network expansion.
+Only folder synchronization is public. Low-level filesystem and single-file transfer primitives
+remain internal implementation details. Folder sync is content-hash incremental and intentionally
+does not delete destination-only files; this provides rsync-like update behavior without requiring
+SSH, rsync, or a platform-specific executable.
 
 Completed-process export is a local publication transaction. Data is checksummed into a sibling
 staging path, renamed into visibility only after the complete transfer succeeds, and optionally
@@ -89,6 +90,7 @@ release an assignment or infer artifacts from workload type.
 ## Upstream constraints
 
 Personal Colab has no supported VM suspend/snapshot operation, guaranteed accelerator inventory,
-or compute-unit balance API. Reconnect is possible while an assignment endpoint and kernel remain
-live; after Colab reclaims it, only persisted local metadata remains. The server reports these
-conditions rather than emulating unsupported behavior.
+or compute-unit balance API. The server does not scrape the browser-only balance endpoint; it links
+to Colab's account-management page instead. Reconnect is possible while an assignment endpoint and
+kernel remain live; after Colab reclaims it, only persisted local metadata remains. The server
+reports these conditions rather than emulating unsupported behavior.

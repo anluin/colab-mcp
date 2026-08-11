@@ -1,0 +1,4 @@
+interface:
+  display_name: "Repair Colab MCP"
+  short_description: "Diagnose and patch colab-mcp through GitHub CLI"
+  default_prompt: "Use $colab-self-repair to diagnose this failure and, if appropriate, prepare a tested GitHub patch."
