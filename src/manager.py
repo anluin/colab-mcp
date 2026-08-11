@@ -991,6 +991,20 @@ class ColabManager:
             )
         return result
 
+    async def _refresh_runtime_proxy(self, session: ManagedSessionState) -> bool:
+        """Refresh a rotated runtime-proxy credential without changing ownership."""
+        assignments = await asyncio.to_thread(self.client().list_assignments)
+        assignment = next((item for item in assignments if item.endpoint == session.endpoint), None)
+        if assignment is None:
+            return False
+        proxy = assignment.runtime_proxy_info
+        changed = session.token != proxy.token or session.url != proxy.url
+        if changed:
+            session.token = proxy.token
+            session.url = proxy.url
+            self.store.add(session)
+        return changed
+
     async def reconcile(
         self, forget_stale: bool = False, release_orphans: bool = False
     ) -> dict[str, Any]:
@@ -1117,14 +1131,17 @@ class ColabManager:
                 with self._kernel_clients_guard:
                     if self._kernel_clients.get(session.name) is kernel:
                         self._kernel_clients.pop(session.name, None)
+                response = getattr(error, "response", None)
+                http_status_code = getattr(response, "status_code", None)
+                details = {
+                    "kernel_connection_seconds": round(time.monotonic() - connection_started, 3),
+                    "connection_timeout_seconds": connection_timeout,
+                }
+                if isinstance(http_status_code, int):
+                    details["http_status_code"] = http_status_code
                 raise KernelConnectionError(
                     "Kernel connection failed before the requested operation was sent",
-                    {
-                        "kernel_connection_seconds": round(
-                            time.monotonic() - connection_started, 3
-                        ),
-                        "connection_timeout_seconds": connection_timeout,
-                    },
+                    details,
                 ) from error
 
         def submit(
@@ -1218,9 +1235,14 @@ class ColabManager:
                     if attempt + 1 >= connection_attempts:
                         error.details["retries"] = attempt
                         raise
+                    proxy_refreshed = False
+                    if error.details.get("http_status_code") in {401, 403, 404}:
+                        proxy_refreshed = await self._refresh_runtime_proxy(session)
                     logger.warning(
-                        "kernel_connection_retry session=%s operation_not_sent=true preserve_kernel_id=true",
+                        "kernel_connection_retry session=%s operation_not_sent=true "
+                        "preserve_kernel_id=true proxy_refreshed=%s",
                         session.name,
+                        proxy_refreshed,
                     )
         raise AssertionError("unreachable")
 
@@ -1329,13 +1351,18 @@ class ColabManager:
                     )
                 else:
                     outputs = await self.execute(code, name, timeout, output_limit=3_000_000)
-            except KernelConnectionError:
+            except KernelConnectionError as error:
                 # Connection/preflight failed before this operation was sent. It is
                 # safe to retry every operation with the same lease and fingerprint.
+                proxy_refreshed = False
+                if error.details.get("http_status_code") in {401, 403, 404}:
+                    proxy_refreshed = await self._refresh_runtime_proxy(session)
                 logger.warning(
-                    "kernel_reconnect_retry operation=%s session=%s operation_not_sent=true",
+                    "kernel_reconnect_retry operation=%s session=%s operation_not_sent=true "
+                    "proxy_refreshed=%s",
                     operation,
                     name,
+                    proxy_refreshed,
                 )
                 if lease_token:
                     await self._operation_lease(session.name, lease_token)

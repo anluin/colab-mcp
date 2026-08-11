@@ -946,6 +946,54 @@ def test_kernel_connection_retry_never_clears_owned_incarnation_kernel_id(
     assert instance.store.get("runtime").kernel_id == "owned-kernel"
 
 
+def test_kernel_connection_404_refreshes_rotated_proxy_before_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.kernel_id = "owned-kernel"
+    instance.store.add(runtime)
+    received_tokens = []
+
+    class ProxyNotFound(Exception):
+        response = SimpleNamespace(status_code=404)
+
+    class FakeKernel:
+        id = "owned-kernel"
+
+        def start(self, timeout):
+            pass
+
+        def execute(self, code, timeout):
+            return {"outputs": [{"output_type": "stream", "text": "ok\n"}]}
+
+        def stop(self, shutdown_kernel=False):
+            pass
+
+    def kernel_factory(**kwargs):
+        received_tokens.append(kwargs["proxy_token"])
+        if len(received_tokens) == 1:
+            raise ProxyNotFound("rotated proxy")
+        return FakeKernel()
+
+    assignment = SimpleNamespace(
+        endpoint="endpoint",
+        runtime_proxy_info=SimpleNamespace(token="fresh-secret", url="https://fresh-runtime"),
+    )
+    monkeypatch.setattr(
+        instance, "client", lambda: SimpleNamespace(list_assignments=lambda: [assignment])
+    )
+    monkeypatch.setattr("src.manager.kernel_client", kernel_factory)
+
+    outputs = asyncio.run(instance.execute_python("print('ok')", "runtime"))
+
+    assert outputs == [{"output_type": "stream", "text": "ok\n"}]
+    assert received_tokens == ["secret", "fresh-secret"]
+    recovered = instance.store.get("runtime")
+    assert recovered.url == "https://fresh-runtime"
+    assert recovered.kernel_id == "owned-kernel"
+
+
 def test_lease_bound_download_retries_pre_submission_failure_without_replacing_lease(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
@@ -990,6 +1038,60 @@ def test_lease_bound_download_retries_pre_submission_failure_without_replacing_l
     assert attempts == 2
     assert lease_checks == [("runtime", "b" * 32)]
     assert instance.store.get("runtime").operation_lease_token == "b" * 32
+
+
+def test_lease_bound_download_refreshes_rotated_proxy_before_outer_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    attempts = 0
+    refreshes = 0
+
+    async def execute(*_args, **kwargs):
+        nonlocal attempts
+        attempts += 1
+        assert kwargs["connection_attempts"] == 1
+        if attempts == 1:
+            raise KernelConnectionError("rotated proxy", {"http_status_code": 404})
+        assert instance.store.get("runtime").token == "fresh-secret"
+        return [
+            {
+                "output_type": "stream",
+                "text": '__COLAB_MCP_RESULT__{"ok":true,"result":{"ok":true}}\n',
+            }
+        ]
+
+    async def refresh(session_state):
+        nonlocal refreshes
+        refreshes += 1
+        session_state.token = "fresh-secret"
+        instance.store.add(session_state)
+        return True
+
+    async def preserve_lease(name, token):
+        assert (name, token) == ("runtime", "b" * 32)
+        return runtime, {"lease_token": token, "runtime_fingerprint": "a" * 32}
+
+    instance.execute = execute
+    instance._refresh_runtime_proxy = refresh
+    instance._operation_lease = preserve_lease
+
+    result = asyncio.run(
+        instance._remote_operation(
+            "fs_read",
+            {"path": "/content/file", "offset": 0, "limit": 3},
+            "runtime",
+            lease_token="b" * 32,
+        )
+    )
+
+    assert result == {"ok": True}
+    assert attempts == 2
+    assert refreshes == 1
 
 
 def test_process_start_retries_when_connection_failed_before_submission(tmp_path, monkeypatch):
