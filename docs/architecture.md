@@ -3,6 +3,16 @@
 Colab MCP is a local stdio MCP server. A human authenticates once; trusted agents then use a
 non-interactive server to control ephemeral Colab assignments.
 
+`colab-mcp serve` is a stable protocol supervisor; `serve-worker` is its private replaceable MCP
+implementation. The supervisor owns the client stdio streams, augments the worker's tool list with
+one connector-administration tool, and forwards all other JSON-RPC messages without changing request
+IDs. A reload drains forwarded calls, validates a candidate through initialize, tools/list, required
+lifecycle tools, and health, then atomically changes the forwarding target. Candidate failure closes
+only the candidate. Worker shutdown never releases a runtime. The fixed source root and optional
+expected source fingerprint prevent a reload from following a concurrently changed directory. An
+explicit source-root binding is restricted to a local Git checkout whose origin is exactly the
+project's GitHub repository and becomes active only after candidate validation.
+
 ## Boundaries
 
 1. `cli.py` owns human authentication, diagnostics, and MCP-client registration.
@@ -54,6 +64,11 @@ Operations for one runtime are serialized because the Jupyter channel is sequent
 runtimes remain independent. A confirmed connection/preflight failure reconnects once for every
 operation, including mutations, while preserving the owned kernel identity, lease, and fingerprint.
 Once caller code may have been sent, ambiguous outcomes are never automatically retried.
+
+Worker reload emits the standard tool-list-changed notification after a successful swap. Existing
+tool implementations change in the same client task; visibility of newly added schemas still
+depends on the client's notification support and model-turn boundary. The stable supervisor,
+dependencies, plugin skills, and manifest remain outside the worker reload boundary.
 
 Transfers begin with repeated upstream assignment observations and a remote incarnation check. The
 probe relies on the session's existing background heartbeat instead of synchronously waiting on the

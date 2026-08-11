@@ -305,7 +305,8 @@ def main() -> None:
     doctor_parser.add_argument(
         "--live", action="store_true", help="Also verify the authenticated Colab assignments API"
     )
-    commands.add_parser("serve", help="Run the non-interactive MCP stdio server")
+    commands.add_parser("serve", help="Run the supervised non-interactive MCP stdio server")
+    commands.add_parser("serve-worker", help=argparse.SUPPRESS)
 
     install_parser = commands.add_parser("install", help="Register with an MCP client")
     install_parser.add_argument(
@@ -329,6 +330,10 @@ def main() -> None:
     elif args.command == "doctor":
         doctor(args.live)
     elif args.command == "serve":
+        from .supervisor import main as serve
+
+        serve()
+    elif args.command == "serve-worker":
         from .server import main as serve
 
         serve()

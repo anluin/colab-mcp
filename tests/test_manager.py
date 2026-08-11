@@ -520,7 +520,10 @@ def test_keepalive_retries_after_transient_error_and_persists_health(tmp_path, m
         instance.client = lambda: FakeClient()
         instance.ensure_keepalive(instance.resolve("runtime"))
         deadline = asyncio.get_running_loop().time() + 1
-        while len(attempts) < 2 and asyncio.get_running_loop().time() < deadline:
+        while asyncio.get_running_loop().time() < deadline:
+            current = instance.store.get("runtime")
+            if len(attempts) >= 2 and current.keepalive_status == "healthy":
+                break
             await asyncio.sleep(0.01)
         await instance.shutdown_keepalives()
 

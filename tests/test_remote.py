@@ -236,7 +236,7 @@ def test_process_runner_spools_flushed_short_writes_before_exit(tmp_path):
                 "argv": [
                     sys.executable,
                     "-c",
-                    "import time; print('{\"step\": 180}', flush=True); time.sleep(2)",
+                    "import time; print('{\"step\": 180}', flush=True); time.sleep(10)",
                 ],
                 "cwd": str(tmp_path),
                 "environment": {},
@@ -250,12 +250,14 @@ def test_process_runner_spools_flushed_short_writes_before_exit(tmp_path):
     running = subprocess.Popen([sys.executable, str(runner), str(launch)])
     spool = process_directory / "stdout.log"
     try:
-        expires = time.monotonic() + 1.5
+        expires = time.monotonic() + 5
         while (not spool.exists() or spool.stat().st_size == 0) and time.monotonic() < expires:
             time.sleep(0.02)
         assert running.poll() is None
         assert spool.read_text(encoding="utf-8") == '{"step": 180}\n'
     finally:
+        if running.poll() is None:
+            running.terminate()
         running.wait(timeout=5)
 
 

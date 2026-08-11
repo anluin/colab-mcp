@@ -192,6 +192,27 @@ status/list results for `watching`, `degraded`, `completed`, or `held` and per-r
 All public MCP input properties carry schema descriptions. Optional fields state their default,
 units, bounds, selection behavior, or destructive effect directly in `tools/list`; agents should
 treat that generated schema as authoritative rather than guessing from parameter names.
+
+### In-task worker reload
+
+`colab-mcp serve` is a stable stdio supervisor. The public `colab_connector` tool reports the
+currently loaded worker fingerprint and can replace that worker without closing the MCP connection
+owned by Codex or Claude. After editing worker code, call `action="status"`, copy
+`available_source_fingerprint`, then call `action="reload"` with it as
+`expected_source_fingerprint`. Reload waits for submitted MCP calls, starts a candidate from the
+fixed source root, completes MCP initialization, verifies the required lifecycle tools and
+`colab_health`, and only then switches traffic. Failure leaves the prior worker active.
+
+Reload closes only the old worker's local kernel channels and heartbeat tasks. Persisted assignment,
+process, and export ownership remains available to the replacement, and remotely durable processes
+continue. Added or removed MCP tools trigger `notifications/tools/list_changed`; implementations of
+existing tools are available immediately. Changes to `supervisor.py`, dependencies/`uv.lock`, plugin
+skills, or the plugin manifest require the normal client/plugin refresh. The supervisor never
+watches partially written files. Its root is fixed at startup through the installed project or
+`COLAB_MCP_HOT_RELOAD_ROOT`. A plugin worker initially installed through `uvx` may explicitly bind
+an agent-supplied checkout with `source_root`; that path is accepted only when local Git identifies
+its origin as `anluin/colab-mcp`, and the binding occurs only after candidate validation succeeds.
+
 `colab_execute` is operation-lease guarded and returns `outputs`, `lease`, and `timings`. Timings
 separate assignment lookup, kernel connection, kernel preflight, local output processing, retries,
 and total duration. The upstream kernel client combines request submission, remote execution, and

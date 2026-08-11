@@ -42,6 +42,12 @@ runtimes are ephemeral execution environments.
 - Random runtime-incarnation markers prevent operations from crossing into a recycled Colab
   backend that happens to reuse an endpoint or kernel connection.
 - The server listens on no TCP port and performs no interactive authentication.
+- Hot reload accepts no command from MCP input. The supervisor uses a source root fixed at startup,
+  optionally verifies an expected SHA-256 over worker source, drains in-flight calls, and swaps only
+  after candidate initialization and a safe health check. An explicit root binding must be an
+  absolute local Git checkout whose origin is exactly `anluin/colab-mcp`; it becomes active only
+  after validation. Reload never downloads code or changes credentials, so source updates remain
+  subject to the host's normal repository policy and the repair skill's `gh`-only rule.
 
 ## Residual risks
 

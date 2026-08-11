@@ -13,7 +13,8 @@ Use GitHub CLI exclusively for every GitHub network operation.
 4. Reproduce the failure before editing. Preserve unrelated working-tree changes.
 5. Patch the smallest isolated layer, add failure-path tests, and run formatting, typing, tests, packaging, and an MCP handshake.
 6. For Colab behavior, perform the smallest live validation and release every assignment in `finally`.
-7. Use local Git only for branch, diff, commit, and freshness checks. Use `gh` for all remote GitHub reads, pushes, issues, and pull requests.
-8. Push or create a PR only when the user's task authorizes that external change. Report live limitations honestly.
+7. If `colab_connector` is available and only worker implementation code changed, call `action="status"`, retain its `available_source_fingerprint`, then call `action="reload"` with that fingerprint. When status points to an installed cache rather than the checkout you patched, pass that absolute `source_root`; binding succeeds only when local Git identifies `anluin/colab-mcp` as its origin. Confirm the worker PID changed and rerun the failing MCP call in the same task. A failed reload keeps the previous worker; follow its returned resolution. Changes to `supervisor.py`, plugin skills, or the plugin manifest still require reinstall/restart.
+8. Use local Git only for branch, diff, commit, and freshness checks. Use `gh` for all remote GitHub reads, pushes, issues, and pull requests.
+9. Push or create a PR only when the user's task authorizes that external change. Report live limitations honestly.
 
 Never expose OAuth tokens, runtime proxy tokens, browser cookies, or captured headers. Never weaken fingerprint or lease checks to make a flaky operation appear successful.

@@ -110,13 +110,26 @@ lease and source file are stable.
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,
 VRAM, driver, and CUDA values returned. A CPU result contains an empty GPU list.
-# Agent-visible recovery guidance
+## Agent-visible recovery guidance
 
 Every MCP tool description includes the recovery action for failures specific to that
 operation. The server-level instructions define the common error-code playbook. MCP
 clients should expose both descriptions to the agent; if a client hides server
 instructions, the tool descriptions remain sufficient for the immediate next action.
-# Lease-bound transfer cannot connect
+
+## Worker reload fails
+
+Call `colab_connector(action="status")`. If `worker_running=true`, the previous implementation is
+still serving tools. `hot_reload_source_changed` means files changed after status; inspect them and
+retry with the new available fingerprint. A candidate initialization, tool-list, or health failure
+means the candidate was discarded; run the local quality gates and retry. A drain timeout never
+cancels submitted work: wait for the call to return or manage a durable process explicitly.
+
+`reload_available=false` means the reloadable worker source matches the active fingerprint. Changes
+to `supervisor.py`, dependencies, plugin skills, or the manifest are intentionally outside this
+boundary and require reinstall/restart. If `colab_connector` is absent, the client is still attached
+to a pre-supervisor release and needs this one-time restart before future worker fixes can hot-reload.
+## Lease-bound transfer cannot connect
 
 All operations automatically retry one
 `kernel_connection_failed_request_not_submitted` failure after confirming that the same assignment

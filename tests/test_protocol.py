@@ -24,6 +24,7 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 compute_units = await client.call_tool("colab_compute_units", {})
                 assert initialized.serverInfo.name == "Google Colab Runtime"
                 assert {
+                    "colab_connector",
                     "colab_start",
                     "colab_run_command",
                     "colab_process_export",
@@ -44,6 +45,45 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_transfer_upload",
                     "colab_transfer_download",
                 }.isdisjoint(names)
+
+                status = await client.call_tool("colab_connector", {"action": "status"})
+                assert not status.isError
+                status_payload = status.structuredContent["result"]
+                original_pid = status_payload["worker_pid"]
+                assert (
+                    status_payload["active_source_fingerprint"]
+                    == status_payload["available_source_fingerprint"]
+                )
+
+                rejected = await client.call_tool(
+                    "colab_connector",
+                    {
+                        "action": "reload",
+                        "expected_source_fingerprint": "0" * 64,
+                        "drain_timeout_seconds": 5,
+                    },
+                )
+                assert rejected.isError
+                assert rejected.structuredContent["result"]["worker_pid"] == original_pid
+                assert rejected.structuredContent["result"]["rollback_used"] is True
+
+                reloaded = await client.call_tool(
+                    "colab_connector",
+                    {
+                        "action": "reload",
+                        "expected_source_fingerprint": status_payload[
+                            "available_source_fingerprint"
+                        ],
+                        "drain_timeout_seconds": 30,
+                    },
+                )
+                assert not reloaded.isError
+                reload_payload = reloaded.structuredContent["result"]
+                assert reload_payload["reloaded"] is True
+                assert reload_payload["previous_worker_pid"] == original_pid
+                assert reload_payload["worker_pid"] != original_pid
+                assert reload_payload["validated_tool_count"] == len(names)
+                assert not (await client.call_tool("colab_health", {})).isError
 
                 recovery_terms = {
                     "colab_sessions": "stale",

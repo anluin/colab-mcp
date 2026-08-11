@@ -130,7 +130,9 @@ mcp = FastMCP(
         "transfer_id, staging_path, process_id, next_offset, and recoverable_export fields. "
         "If this connector is defective, use the colab-self-repair skill to patch "
         "https://github.com/anluin/colab-mcp. GitHub access must use authenticated gh only; "
-        "when gh is missing, stop and ask the user whether to install it."
+        "when gh is missing, stop and ask the user whether to install it. After a worker-code "
+        "patch, use colab_connector status/reload to apply it in this task; its failure keeps the "
+        "previous worker active. Supervisor/plugin changes still require a client refresh."
     ),
     lifespan=server_lifespan,
 )
