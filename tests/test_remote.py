@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from colab_cli.state import SessionState
 
-from src.manager import ColabManager, ManagedSessionState
+from src.manager import ColabManager, ManagedSessionState, _guarded_python_source
 from src.remote import (
     MAX_OUTPUT_LIMIT,
     MAX_PROCESS_OUTPUT_LIMIT,
@@ -160,6 +160,35 @@ def test_operation_lease_is_validated_inside_same_remote_request_before_chunk_mu
     )
     assert "transfer_offset_conflict" in code
     assert "already_applied" in code
+
+
+def test_remote_lease_rotation_retains_unexpired_inflight_leases():
+    probe = build_remote_code(
+        "lease_probe",
+        {
+            "runtime_fingerprint": "a" * 32,
+            "issue_lease_token": "b" * 32,
+            "lease_expires_at": "2099-01-01T00:00:00+00:00",
+        },
+    )
+    guarded = build_remote_code(
+        "fs_stat",
+        {
+            "path": "/content/file",
+            "runtime_fingerprint": "a" * 32,
+            "operation_lease_token": "c" * 32,
+        },
+    )
+    assert "_cm_retained_leases" in probe
+    assert "'leases': _cm_retained_leases" in probe
+    assert "_cm_matching_lease" in guarded
+    assert "_cm_matching_lease['expires_at']" in guarded
+
+
+def test_guarded_execution_accepts_a_retained_inflight_lease():
+    source = _guarded_python_source("print('ok')", "a" * 32, "b" * 32)
+    assert "__cm_candidates = __cm_lease.get('leases')" in source
+    assert "__cm_match['expires_at']" in source
 
 
 def test_workspace_bundle_publish_rejects_unsafe_or_undeclared_members():

@@ -255,11 +255,21 @@ try:
                 raise RuntimeError('operation_lease_missing: probe again before retrying')
             _cm_operation_lease = _cm_json.loads(
                 _cm_operation_lease_path.read_text(encoding='utf-8'))
-            if (_cm_operation_lease.get('token') != _cm_operation_lease_token
+            _cm_lease_candidates = _cm_operation_lease.get('leases')
+            if not isinstance(_cm_lease_candidates, list):
+                _cm_lease_candidates = [{{
+                    'token': _cm_operation_lease.get('token'),
+                    'expires_at': _cm_operation_lease.get('expires_at'),
+                }}]
+            _cm_matching_lease = next((
+                item for item in _cm_lease_candidates
+                if isinstance(item, dict) and item.get('token') == _cm_operation_lease_token
+            ), None)
+            if (_cm_matching_lease is None
                     or _cm_operation_lease.get('runtime_fingerprint') != _cm_actual_fingerprint):
                 raise RuntimeError('operation_lease_stale: lease does not own this incarnation')
             _cm_lease_expiry = _cm_datetime.datetime.fromisoformat(
-                _cm_operation_lease['expires_at'])
+                _cm_matching_lease['expires_at'])
             if _cm_lease_expiry <= _cm_datetime.datetime.now(_cm_datetime.timezone.utc):
                 raise RuntimeError('operation_lease_expired: probe again before retrying')
         _cm_process_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -272,11 +282,38 @@ try:
                 or not all(char in '0123456789abcdef' for char in _cm_issued_token)):
             raise ValueError('issue_lease_token must be 32 hexadecimal characters')
         _cm_operation_lease_path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _cm_now = _cm_datetime.datetime.now(_cm_datetime.timezone.utc)
+        _cm_retained_leases = []
+        if _cm_operation_lease_path.is_file():
+            try:
+                _cm_prior_lease = _cm_json.loads(
+                    _cm_operation_lease_path.read_text(encoding='utf-8'))
+                _cm_prior_candidates = _cm_prior_lease.get('leases')
+                if not isinstance(_cm_prior_candidates, list):
+                    _cm_prior_candidates = [{{
+                        'token': _cm_prior_lease.get('token'),
+                        'expires_at': _cm_prior_lease.get('expires_at'),
+                    }}]
+                if _cm_prior_lease.get('runtime_fingerprint') == _cm_actual_fingerprint:
+                    _cm_retained_leases = [
+                        item for item in _cm_prior_candidates
+                        if isinstance(item, dict)
+                        and item.get('token') != _cm_issued_token
+                        and isinstance(item.get('expires_at'), str)
+                        and _cm_datetime.datetime.fromisoformat(item['expires_at']) > _cm_now
+                    ][-7:]
+            except Exception:
+                _cm_retained_leases = []
+        _cm_retained_leases.append({{
+            'token': _cm_issued_token,
+            'expires_at': _cm_expires_at,
+        }})
         _cm_lease_temporary = _cm_operation_lease_path.with_suffix('.tmp')
         _cm_lease_temporary.write_text(_cm_json.dumps({{
             'token': _cm_issued_token,
             'runtime_fingerprint': _cm_actual_fingerprint,
             'expires_at': _cm_expires_at,
+            'leases': _cm_retained_leases,
         }}), encoding='utf-8')
         _cm_lease_temporary.replace(_cm_operation_lease_path)
         _cm_result = {{

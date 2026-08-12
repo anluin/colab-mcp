@@ -195,12 +195,16 @@ __cm_actual = (__cm_state / 'runtime-incarnation').read_text(encoding='ascii').s
 if __cm_actual != {fingerprint!r}:
     raise RuntimeError('runtime_replaced: guarded execution observed a different incarnation')
 __cm_lease = __cm_json.loads((__cm_state / 'operation-lease.json').read_text(encoding='utf-8'))
-if __cm_lease.get('token') != {lease_token!r} or __cm_lease.get('runtime_fingerprint') != __cm_actual:
+__cm_candidates = __cm_lease.get('leases')
+if not isinstance(__cm_candidates, list):
+    __cm_candidates = [{{'token': __cm_lease.get('token'), 'expires_at': __cm_lease.get('expires_at')}}]
+__cm_match = next((item for item in __cm_candidates if isinstance(item, dict) and item.get('token') == {lease_token!r}), None)
+if __cm_match is None or __cm_lease.get('runtime_fingerprint') != __cm_actual:
     raise RuntimeError('operation_lease_stale: guarded execution lease does not match')
-if __cm_datetime.datetime.fromisoformat(__cm_lease['expires_at']) <= __cm_datetime.datetime.now(__cm_datetime.timezone.utc):
+if __cm_datetime.datetime.fromisoformat(__cm_match['expires_at']) <= __cm_datetime.datetime.now(__cm_datetime.timezone.utc):
     raise RuntimeError('operation_lease_expired: guarded execution lease expired')
 print({CONTROL_TIMING_PREFIX!r} + __cm_json.dumps({{'fingerprint_validation_seconds': round(__cm_time.monotonic() - __cm_guard_started, 6)}}))
-del __cm_datetime, __cm_json, __cm_pathlib, __cm_time, __cm_guard_started, __cm_state, __cm_actual, __cm_lease
+del __cm_datetime, __cm_json, __cm_pathlib, __cm_time, __cm_guard_started, __cm_state, __cm_actual, __cm_lease, __cm_candidates, __cm_match
 {code}
 """
 
@@ -540,6 +544,10 @@ class ColabManager:
         self._kernel_clients: dict[str, Any] = {}
         self._kernel_locks: dict[str, asyncio.Lock] = {}
         self._kernel_clients_guard = threading.Lock()
+        # Several verified transfers may overlap within one runtime. A newer
+        # probe must not invalidate an already-running transfer locally; the
+        # runtime enforces the same bounded, expiring lease set.
+        self._operation_leases: dict[str, dict[str, str]] = {}
         self._keepalives: dict[str, asyncio.Task] = {}
         self.keepalive_seconds = int(os.environ.get("COLAB_MCP_KEEPALIVE_SECONDS", "60"))
         self._export_watchers: dict[tuple[str, str], asyncio.Task] = {}
@@ -1526,6 +1534,16 @@ class ColabManager:
         session.operation_lease_issued_at = issued_at.isoformat()
         session.operation_lease_expires_at = expires_at.isoformat()
         self.store.add(session)
+        lease_pool = self._operation_leases.setdefault(session.name, {})
+        now = datetime.datetime.now(datetime.UTC)
+        retained = {
+            token: expiry
+            for token, expiry in lease_pool.items()
+            if datetime.datetime.fromisoformat(expiry) > now
+        }
+        lease_pool.clear()
+        lease_pool.update(dict(list(retained.items())[-7:]))
+        lease_pool[lease_token] = expires_at.isoformat()
         return {
             "status": "stable",
             "session": session.name,
@@ -1541,7 +1559,9 @@ class ColabManager:
     def _validate_operation_lease(self, session: SessionState, lease_token: str) -> None:
         expected = getattr(session, "operation_lease_token", None)
         expires_at = getattr(session, "operation_lease_expires_at", None)
-        if not expected or lease_token != expected:
+        if lease_token != expected:
+            expires_at = self._operation_leases.get(session.name, {}).get(lease_token)
+        if not expires_at:
             raise OperationLeaseError(
                 "operation_lease_stale",
                 "The opaque lease does not match the latest probe for this session.",
@@ -2806,6 +2826,17 @@ class ColabManager:
         session = self.resolve(name)
         if self.process_journal.get(session.name, process_id) is None:
             raise ValueError(f"Unknown owned process_id: {process_id}")
+        watcher = self._export_watchers.pop((session.name, process_id), None)
+        if watcher is not None and watcher is not asyncio.current_task():
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+        self._update_auto_export(
+            session.name,
+            process_id,
+            status="held",
+            last_error="automatic export explicitly abandoned and staging cleaned",
+            last_attempt_at=datetime.datetime.now(datetime.UTC).isoformat(),
+        )
         destination = Path(local_path).expanduser().resolve()
         staged = self._process_export_stage(process_id, remote_path, destination)
         existed = staged.exists()
@@ -2818,6 +2849,7 @@ class ColabManager:
             "session": session.name,
             "staging_path": str(staged),
             "removed": existed,
+            "watcher_stopped": watcher is not None,
         }
 
     async def process_export(

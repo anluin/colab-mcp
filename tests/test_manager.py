@@ -692,6 +692,19 @@ def test_stale_operation_lease_is_rejected_before_assignment_lookup(tmp_path, mo
     assert caught.value.code == "operation_lease_stale"
 
 
+def test_rotated_operation_lease_remains_valid_for_inflight_transfer(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+    instance._operation_leases["runtime"] = {
+        "c" * 32: "2099-01-01T00:00:00+00:00",
+    }
+
+    instance._validate_operation_lease(runtime, "c" * 32)
+
+
 def test_guard_timing_is_extracted_without_leaking_control_output():
     outputs = [
         {
@@ -1803,7 +1816,14 @@ def test_process_export_cleanup_only_removes_owned_deterministic_stage(
 ):
     instance = manager(tmp_path, monkeypatch)
     instance.store.add(session("runtime", "endpoint"))
-    instance.process_journal.update("runtime", {"process_id": "process", "status": "exited"})
+    instance.process_journal.update(
+        "runtime",
+        {
+            "process_id": "process",
+            "status": "exited",
+            "auto_export": {"status": "degraded", "rules": [], "results": {}},
+        },
+    )
     destination = tmp_path / "published"
     stage = instance._process_export_stage("process", "/content/checkpoints", destination.resolve())
     stage.mkdir()
@@ -1814,6 +1834,8 @@ def test_process_export_cleanup_only_removes_owned_deterministic_stage(
         )
     )
     assert result["removed"] is True
+    assert result["watcher_stopped"] is False
+    assert instance.process_journal.get("runtime", "process")["auto_export"]["status"] == "held"
     assert not stage.exists()
 
 
