@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import requests
 
 from src.cli import (
     _client_executable,
@@ -143,6 +144,79 @@ def test_require_local_file(tmp_path: Path):
 def test_require_local_file_rejects_missing(tmp_path: Path):
     with pytest.raises(ValueError):
         require_local_file(str(tmp_path / "missing.py"))
+
+
+def test_raw_download_uses_absolute_content_path(tmp_path, monkeypatch):
+    payload = b"video-bytes"
+    checksum = hashlib.sha256(payload).hexdigest()
+    requested = []
+
+    class Response:
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, _chunk_size):
+            yield payload
+
+    def get(url, **kwargs):
+        requested.append((url, kwargs))
+        return Response()
+
+    monkeypatch.setattr("src.manager.requests.get", get)
+    destination = tmp_path / "video.mp4"
+    from src.manager import _raw_download_to_file
+
+    _raw_download_to_file(
+        SimpleNamespace(url="https://runtime", token="secret"),
+        "/content/workspaces/speed/video.mp4",
+        destination,
+        "none",
+        len(payload),
+        len(payload),
+        checksum,
+        checksum,
+        1_000,
+        128,
+    )
+
+    assert requested[0][0] == "https://runtime/files/content/workspaces/speed/video.mp4"
+    assert destination.read_bytes() == payload
+
+
+def test_raw_download_refreshes_rotated_proxy_and_retries_fast_path(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    attempts = []
+
+    def download(session_state, *_args):
+        attempts.append(session_state.token)
+        if len(attempts) == 1:
+            raise requests.HTTPError("masked authentication failure")
+
+    async def refresh(session_state):
+        session_state.token = "fresh-secret"
+        return True
+
+    monkeypatch.setattr("src.manager._raw_download_to_file", download)
+    instance._refresh_runtime_proxy = refresh
+
+    asyncio.run(
+        ColabManager._raw_download_file(
+            instance,
+            runtime,
+            "/content/workspaces/speed/video.mp4",
+            tmp_path / "video.mp4.part",
+            "none",
+            1,
+            1,
+            "a",
+            "a",
+            1_000,
+            128,
+        )
+    )
+
+    assert attempts == ["secret", "fresh-secret"]
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits are not Windows ACLs")
@@ -783,6 +857,26 @@ def test_explicit_operation_lease_fails_fast_when_assignment_vanished(tmp_path, 
         asyncio.run(ColabManager._operation_lease(instance, "runtime", "b" * 32))
     assert caught.value.code == "assignment_no_longer_exists"
     assert time.monotonic() - started < 5
+
+
+def test_operation_lease_adopts_rotated_runtime_proxy(tmp_path, monkeypatch):
+    instance = manager(tmp_path, monkeypatch)
+    runtime = session("runtime", "endpoint")
+    runtime.operation_lease_token = "b" * 32
+    runtime.operation_lease_expires_at = "2099-01-01T00:00:00+00:00"
+    instance.store.add(runtime)
+
+    class CurrentClient:
+        def list_assignments(self):
+            proxy = SimpleNamespace(token="fresh-secret", url="https://fresh-runtime")
+            return [SimpleNamespace(endpoint="endpoint", runtime_proxy_info=proxy)]
+
+    instance.client = lambda: CurrentClient()
+    selected, _lease = asyncio.run(ColabManager._operation_lease(instance, "runtime", "b" * 32))
+
+    assert selected.token == "fresh-secret"
+    assert selected.url == "https://fresh-runtime"
+    assert instance.store.get("runtime").token == "fresh-secret"
 
 
 def test_stale_operation_lease_is_rejected_before_assignment_lookup(tmp_path, monkeypatch):

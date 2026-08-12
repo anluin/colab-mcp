@@ -1310,7 +1310,13 @@ class ColabManager:
         assignment = next((item for item in assignments if item.endpoint == session.endpoint), None)
         if assignment is None:
             return False
-        proxy = assignment.runtime_proxy_info
+        return self._adopt_runtime_proxy(session, assignment)
+
+    def _adopt_runtime_proxy(self, session: ManagedSessionState, assignment: Any) -> bool:
+        """Persist the current proxy URL and token returned for an owned assignment."""
+        proxy = getattr(assignment, "runtime_proxy_info", None)
+        if proxy is None:
+            return False
         changed = session.token != proxy.token or session.url != proxy.url
         if changed:
             session.token = proxy.token
@@ -1751,16 +1757,19 @@ class ColabManager:
         observed: list[str] = []
         for index in range(observations):
             assignments = await asyncio.to_thread(self.client().list_assignments)
-            endpoints = {item.endpoint for item in assignments}
+            assignment = next(
+                (item for item in assignments if item.endpoint == session.endpoint), None
+            )
             current = self.store.get(session.name)
             if current is None or current.endpoint != session.endpoint:
                 raise RuntimeError(
                     "allocation_lease_changed: local session ownership changed during probe"
                 )
-            if session.endpoint not in endpoints:
+            if assignment is None:
                 raise RuntimeError(
                     "allocation_lease_lost: the tracked Colab assignment is no longer active"
                 )
+            self._adopt_runtime_proxy(session, assignment)
             observed.append(session.endpoint)
             if index + 1 < observations and interval:
                 await asyncio.sleep(interval)
@@ -1850,12 +1859,14 @@ class ColabManager:
                 "Colab assignment lookup did not complete within five seconds.",
                 {"session": session.name, "elapsed_seconds": round(time.monotonic() - started, 3)},
             ) from error
-        if session.endpoint not in {item.endpoint for item in assignments}:
+        assignment = next((item for item in assignments if item.endpoint == session.endpoint), None)
+        if assignment is None:
             raise OperationLeaseError(
                 "assignment_no_longer_exists",
                 "The tracked Colab assignment is no longer active.",
                 {"session": session.name, "elapsed_seconds": round(time.monotonic() - started, 3)},
             )
+        self._adopt_runtime_proxy(session, assignment)
         lease["assignment_lookup_seconds"] = round(time.monotonic() - started, 3)
         return session, lease
 
@@ -2285,19 +2296,31 @@ class ColabManager:
         max_total_bytes: int,
         chunk_size: int,
     ) -> None:
-        await asyncio.to_thread(
-            _raw_download_to_file,
-            session,
-            remote_path,
-            destination,
-            codec,
-            content_bytes,
-            wire_bytes,
-            wire_checksum,
-            content_checksum,
-            max_total_bytes,
-            chunk_size,
-        )
+        for attempt in range(2):
+            try:
+                await asyncio.to_thread(
+                    _raw_download_to_file,
+                    session,
+                    remote_path,
+                    destination,
+                    codec,
+                    content_bytes,
+                    wire_bytes,
+                    wire_checksum,
+                    content_checksum,
+                    max_total_bytes,
+                    chunk_size,
+                )
+                return
+            except requests.RequestException:
+                if attempt:
+                    raise
+                refreshed = await self._refresh_runtime_proxy(session)
+                logger.warning(
+                    "raw_download_retry session=%s proxy_refreshed=%s",
+                    session.name,
+                    refreshed,
+                )
 
     async def _remote_stat_or_none(
         self,
