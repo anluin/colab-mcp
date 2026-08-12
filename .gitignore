@@ -4,5 +4,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .test-state/
+.live-validation/
 *.executed.ipynb
 *.resumed.ipynb

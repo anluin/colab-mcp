@@ -23,18 +23,34 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 health = await client.call_tool("colab_health", {})
                 compute_units = await client.call_tool("colab_compute_units", {})
                 assert initialized.serverInfo.name == "Google Colab Runtime"
-                assert {
+                assert names == {
                     "colab_connector",
+                    "colab_health",
+                    "colab_sessions",
+                    "colab_keepalive",
+                    "colab_reconcile",
+                    "colab_inspect",
+                    "colab_create_notebook",
                     "colab_start",
+                    "colab_execute",
                     "colab_run_command",
+                    "colab_process_start",
+                    "colab_process_status",
+                    "colab_process_list",
+                    "colab_process_output",
+                    "colab_process_signal",
                     "colab_process_export",
                     "colab_process_export_cleanup",
                     "colab_transfer_cleanup",
-                    "colab_workspace_sync",
                     "colab_allocation_probe",
-                    "colab_keepalive",
+                    "colab_execute_notebook",
                     "colab_stop",
-                } <= names
+                    "colab_pause_notebook",
+                    "colab_resume_notebook",
+                    "colab_paused_notebooks",
+                    "colab_workspace_sync",
+                    "colab_compute_units",
+                }
                 assert not health.isError
                 assert not compute_units.isError
                 assert {

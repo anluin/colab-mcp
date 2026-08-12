@@ -22,6 +22,8 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy src
       - run: uv run pytest -q
+      - run: uv run --with bandit bandit -q -lll -r src scripts
+      - run: uv run --with pip-audit pip-audit
       - run: uv build
       - run: uv run twine check dist/*
       - run: uv run colab-mcp --help

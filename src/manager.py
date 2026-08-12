@@ -916,8 +916,12 @@ class ColabManager:
             if not succeeded and current.consecutive_keepalive_failures >= 2:
                 try:
                     assignments = await asyncio.to_thread(self.client().list_assignments)
-                except Exception:
-                    pass
+                except Exception as error:
+                    logger.warning(
+                        "keepalive_assignment_check_failed session=%s error_type=%s",
+                        name,
+                        type(error).__name__,
+                    )
                 else:
                     if endpoint not in {item.endpoint for item in assignments}:
                         self._persist_keepalive(
@@ -1359,7 +1363,8 @@ class ColabManager:
             reused = kernel is not None
             try:
                 if reused:
-                    assert kernel is not None
+                    if kernel is None:
+                        raise RuntimeError("cached kernel invariant violated")
                     # A harmless request verifies the cached websocket before the
                     # caller's operation is submitted.  Failure here is therefore
                     # always safe to reconnect and retry, including process_start.
@@ -2487,7 +2492,8 @@ class ColabManager:
                 compression,
                 compression_min_savings,
             )
-            assert bundle is not None
+            if bundle is None:
+                raise RuntimeError("workspace bundle construction returned no artifact")
             logical_manifest = json.dumps(changed, sort_keys=True, separators=(",", ":"))
             transfer_id = hashlib.sha256(
                 (remote_folder + "\0" + logical_manifest + "\0" + wire_checksum).encode()

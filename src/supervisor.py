@@ -231,7 +231,8 @@ class ColabMcpSupervisor:
             worker,
             {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params},
         )
-        assert worker.process.stdout is not None
+        if worker.process.stdout is None:
+            raise RuntimeError("candidate worker stdout is unavailable")
         while True:
             response = await self._read_message(worker.process.stdout, timeout)
             if response.get("id") == request_id:
@@ -417,7 +418,8 @@ class ColabMcpSupervisor:
             tools.append(CONNECTOR_SCHEMA)
 
     async def _read_worker(self, worker: Worker) -> None:
-        assert worker.process.stdout is not None
+        if worker.process.stdout is None:
+            raise RuntimeError("active worker stdout is unavailable")
         while True:
             line = await worker.process.stdout.readline()
             if not line:

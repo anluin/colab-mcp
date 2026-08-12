@@ -354,11 +354,21 @@ uv run ruff format --check .
 uv run ruff check .
 uv run mypy src
 uv run pytest -q
+uv run --with bandit bandit -q -lll -r src scripts
+uv run --with pip-audit pip-audit
 uv build
 uv run twine check dist/*
 ```
 
 CI runs on Ubuntu, macOS, and Windows with Python 3.12. The live integration has also been verified against a real Tesla T4: allocation, CUDA execution, notebook execution, pause/release, fresh-runtime resume, rerun, and cleanup with zero assignments remaining.
+
+The public workspace-sync probe exercises nested multi-file push, incremental changed/new/unchanged
+selection, multi-chunk binary transfer, destination-only preservation, mandatory VCS exclusion,
+pull-back SHA-256 verification, and runtime cleanup:
+
+```bash
+uv run python scripts/live_workspace_probe.py
+```
 
 The opt-in durability acceptance harness reproduces the large Windows/Codex workload with either
 accelerator. Defaults deliberately consume about five minutes of runtime and transfer two verified
