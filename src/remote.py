@@ -175,6 +175,7 @@ import shutil as _cm_shutil
 import signal as _cm_signal
 import subprocess as _cm_subprocess
 import sys as _cm_sys
+import tarfile as _cm_tarfile
 import time as _cm_time
 import traceback as _cm_traceback
 import uuid as _cm_uuid
@@ -284,6 +285,144 @@ try:
             'observed_at': _cm_datetime.datetime.now(_cm_datetime.timezone.utc).isoformat(),
             'lease_expires_at': _cm_expires_at,
         }}
+    elif _cm_operation == 'workspace_manifest':
+        _cm_workspace = _cm_path(_cm_payload['path'])
+        _cm_max_files = int(_cm_payload['max_files'])
+        _cm_max_total = int(_cm_payload['max_total_bytes'])
+        if not _cm_workspace.exists():
+            _cm_result = {{'path': str(_cm_workspace), 'files': [], 'total_bytes': 0}}
+        elif not _cm_workspace.is_dir():
+            raise NotADirectoryError(str(_cm_workspace))
+        else:
+            _cm_workspace_files = sorted(
+                item for item in _cm_workspace.rglob('*')
+                if item.is_file() and not item.is_symlink())
+            if len(_cm_workspace_files) > _cm_max_files:
+                raise ValueError('workspace exceeds max_files')
+            _cm_workspace_total = sum(item.stat().st_size for item in _cm_workspace_files)
+            if _cm_workspace_total > _cm_max_total:
+                raise ValueError('workspace exceeds max_total_bytes')
+            _cm_workspace_manifest = []
+            for _cm_item in _cm_workspace_files:
+                _cm_digest = _cm_hashlib.sha256()
+                with _cm_item.open('rb') as _cm_handle:
+                    for _cm_chunk in iter(lambda: _cm_handle.read(1024 * 1024), b''):
+                        _cm_digest.update(_cm_chunk)
+                _cm_workspace_manifest.append({{
+                    'path': _cm_item.relative_to(_cm_workspace).as_posix(),
+                    'size': _cm_item.stat().st_size,
+                    'sha256': _cm_digest.hexdigest(),
+                }})
+            _cm_result = {{
+                'path': str(_cm_workspace), 'files': _cm_workspace_manifest,
+                'total_bytes': _cm_workspace_total,
+            }}
+    elif _cm_operation == 'workspace_bundle_publish':
+        _cm_archive = _cm_path(_cm_payload['archive_path'])
+        _cm_workspace = _cm_path(_cm_payload['workspace_path'])
+        _cm_max_files = int(_cm_payload['max_files'])
+        _cm_max_total = int(_cm_payload['max_total_bytes'])
+        if not _cm_archive.is_file():
+            raise FileNotFoundError(str(_cm_archive))
+        _cm_wire_digest = _cm_hashlib.sha256()
+        with _cm_archive.open('rb') as _cm_handle:
+            for _cm_chunk in iter(lambda: _cm_handle.read(1024 * 1024), b''):
+                _cm_wire_digest.update(_cm_chunk)
+        if _cm_wire_digest.hexdigest() != _cm_payload['wire_sha256']:
+            raise ValueError('workspace bundle wire checksum mismatch')
+        _cm_publish_root = _cm_state_root / ('workspace-publish-' + _cm_payload['transfer_id'])
+        _cm_shutil.rmtree(_cm_publish_root, ignore_errors=True)
+        _cm_publish_root.mkdir(mode=0o700, parents=True)
+        _cm_published = []
+        _cm_publish_success = False
+        try:
+            _cm_tar_mode = 'r:gz' if _cm_payload['compression'] == 'gzip' else 'r:'
+            with _cm_tarfile.open(_cm_archive, _cm_tar_mode) as _cm_bundle:
+                _cm_members = _cm_bundle.getmembers()
+                if len(_cm_members) > _cm_max_files + 1:
+                    raise ValueError('workspace bundle exceeds max_files')
+                _cm_manifest_member = _cm_bundle.getmember('manifest.json')
+                if not _cm_manifest_member.isfile() or _cm_manifest_member.size > 10_000_000:
+                    raise ValueError('invalid workspace bundle manifest')
+                _cm_manifest_handle = _cm_bundle.extractfile(_cm_manifest_member)
+                if _cm_manifest_handle is None:
+                    raise ValueError('workspace bundle manifest is unreadable')
+                _cm_manifest = _cm_json.loads(_cm_manifest_handle.read().decode('utf-8'))
+                if not isinstance(_cm_manifest, list) or len(_cm_manifest) > _cm_max_files:
+                    raise ValueError('invalid workspace bundle manifest entries')
+                _cm_expected_names = {{'manifest.json'}}
+                _cm_seen_paths = set()
+                _cm_declared_total = 0
+                for _cm_entry in _cm_manifest:
+                    _cm_relative = _cm_entry.get('path') if isinstance(_cm_entry, dict) else None
+                    if (not isinstance(_cm_relative, str) or not _cm_relative
+                            or _cm_relative.startswith('/') or chr(92) in _cm_relative):
+                        raise ValueError('invalid workspace bundle path')
+                    _cm_parts = _cm_pathlib.PurePosixPath(_cm_relative).parts
+                    if any(part in ('', '.', '..') for part in _cm_parts):
+                        raise ValueError('workspace bundle path escapes its root')
+                    if _cm_relative in _cm_seen_paths:
+                        raise ValueError('duplicate workspace bundle path')
+                    _cm_seen_paths.add(_cm_relative)
+                    _cm_size = int(_cm_entry['size'])
+                    if _cm_size < 0:
+                        raise ValueError('invalid workspace bundle file size')
+                    _cm_declared_total += _cm_size
+                    _cm_expected_names.add('files/' + _cm_relative)
+                if _cm_declared_total > _cm_max_total:
+                    raise ValueError('workspace bundle exceeds max_total_bytes')
+                if (len(_cm_members) != len(_cm_expected_names)
+                        or {{member.name for member in _cm_members}} != _cm_expected_names):
+                    raise ValueError('workspace bundle contains undeclared members')
+                for _cm_entry in _cm_manifest:
+                    _cm_relative = _cm_entry['path']
+                    _cm_member = _cm_bundle.getmember('files/' + _cm_relative)
+                    if not _cm_member.isfile() or _cm_member.size != int(_cm_entry['size']):
+                        raise ValueError('workspace bundle member metadata mismatch')
+                    _cm_source = _cm_bundle.extractfile(_cm_member)
+                    if _cm_source is None:
+                        raise ValueError('workspace bundle member is unreadable')
+                    _cm_staged_file = _cm_publish_root.joinpath(*_cm_pathlib.PurePosixPath(_cm_relative).parts)
+                    _cm_staged_file.parent.mkdir(parents=True, exist_ok=True)
+                    _cm_digest = _cm_hashlib.sha256()
+                    _cm_written = 0
+                    with _cm_staged_file.open('wb') as _cm_output:
+                        while True:
+                            _cm_chunk = _cm_source.read(1024 * 1024)
+                            if not _cm_chunk:
+                                break
+                            _cm_written += len(_cm_chunk)
+                            if _cm_written > int(_cm_entry['size']):
+                                raise ValueError('workspace bundle member exceeds declared size')
+                            _cm_digest.update(_cm_chunk)
+                            _cm_output.write(_cm_chunk)
+                    if (_cm_written != int(_cm_entry['size'])
+                            or _cm_digest.hexdigest() != _cm_entry['sha256']):
+                        raise ValueError('workspace bundle content checksum mismatch')
+                _cm_destinations = {{}}
+                for _cm_entry in _cm_manifest:
+                    _cm_relative = _cm_entry['path']
+                    _cm_destination = _cm_workspace.joinpath(*_cm_pathlib.PurePosixPath(_cm_relative).parts)
+                    _cm_destination = _cm_path(str(_cm_destination))
+                    if _cm_destination.exists() and _cm_destination.is_dir():
+                        raise IsADirectoryError(str(_cm_destination))
+                    _cm_destinations[_cm_relative] = _cm_destination
+                for _cm_entry in _cm_manifest:
+                    _cm_relative = _cm_entry['path']
+                    _cm_staged_file = _cm_publish_root.joinpath(*_cm_pathlib.PurePosixPath(_cm_relative).parts)
+                    _cm_destination = _cm_destinations[_cm_relative]
+                    _cm_destination.parent.mkdir(parents=True, exist_ok=True)
+                    _cm_staged_file.replace(_cm_destination)
+                    _cm_published.append({{
+                        'path': _cm_relative, 'size': int(_cm_entry['size']),
+                        'sha256': _cm_entry['sha256'],
+                    }})
+            _cm_publish_success = True
+            _cm_result = {{'files': _cm_published, 'total_bytes': _cm_declared_total}}
+        finally:
+            _cm_shutil.rmtree(_cm_publish_root, ignore_errors=True)
+            if _cm_publish_success:
+                _cm_archive.unlink(missing_ok=True)
     elif _cm_operation == 'transfer_upload_chunk':
         _cm_target = _cm_path(_cm_payload['path'])
         _cm_offset = int(_cm_payload['offset'])

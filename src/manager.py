@@ -6,10 +6,12 @@ import contextlib
 import datetime
 import gzip
 import hashlib
+import io
 import json
 import logging
 import os
 import shutil
+import tarfile
 import tempfile
 import threading
 import time
@@ -377,6 +379,64 @@ def _use_compressed_wire(
         and wire_bytes < content_bytes
         and (content_bytes - wire_bytes) / max(1, content_bytes) >= minimum_savings
     )
+
+
+def _workspace_manifest(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    return [
+        {
+            "path": PurePosixPath(*path.relative_to(root).parts).as_posix(),
+            "size": path.stat().st_size,
+            "sha256": _file_sha256(path),
+        }
+        for path in files
+    ]
+
+
+def _build_workspace_bundle(
+    root: Path,
+    files_by_relative: dict[str, Path],
+    manifest: list[dict[str, Any]],
+    compression: str,
+    compression_min_savings: float,
+) -> tuple[Path, str, int, str]:
+    """Build a deterministic, safe tar bundle for one workspace delta."""
+    descriptor, archive_name = tempfile.mkstemp(prefix="colab-mcp-workspace-", suffix=".tar")
+    os.close(descriptor)
+    archive = Path(archive_name)
+    compressed: Path | None = None
+    manifest_bytes = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    try:
+        with tarfile.open(archive, "w") as bundle:
+            metadata = tarfile.TarInfo("manifest.json")
+            metadata.size = len(manifest_bytes)
+            metadata.mtime = metadata.uid = metadata.gid = 0
+            metadata.mode = 0o600
+            bundle.addfile(metadata, io.BytesIO(manifest_bytes))
+            for item in manifest:
+                source = files_by_relative[item["path"]]
+                info = tarfile.TarInfo("files/" + item["path"])
+                info.size = item["size"]
+                info.mtime = info.uid = info.gid = 0
+                info.mode = 0o600
+                with source.open("rb") as handle:
+                    bundle.addfile(info, handle)
+        codec = "none"
+        wire = archive
+        if compression != "none":
+            candidate, candidate_size, _ = _gzip_local_file(archive)
+            if _use_compressed_wire(
+                compression, archive.stat().st_size, candidate_size, compression_min_savings
+            ):
+                compressed, wire, codec = candidate, candidate, "gzip"
+                archive.unlink()
+            else:
+                candidate.unlink(missing_ok=True)
+        return wire, codec, wire.stat().st_size, _file_sha256(wire)
+    except BaseException:
+        archive.unlink(missing_ok=True)
+        if compressed is not None:
+            compressed.unlink(missing_ok=True)
+        raise
 
 
 def _json_safe(value: Any) -> Any:
@@ -1918,6 +1978,241 @@ class ColabManager:
             if str(error).startswith("FileNotFoundError:"):
                 return None
             raise
+
+    async def workspace_upload(
+        self,
+        local_folder: str,
+        remote_folder: str,
+        name: str | None,
+        chunk_size: int = 2_000_000,
+        max_total_bytes: int = 1_000_000_000,
+        max_files: int = 10_000,
+        compression: str = "auto",
+        compression_min_savings: float = 0.10,
+        lease_token: str | None = None,
+        progress: ProgressCallback | None = None,
+    ) -> dict[str, Any]:
+        """Push a directory delta as one verified bundle instead of per-file RPCs."""
+        _transfer_bounds(chunk_size, max_total_bytes, max_files)
+        compression, _, compression_min_savings = _compression_settings(
+            compression, 0, compression_min_savings
+        )
+        root = Path(local_folder).expanduser().resolve()
+        if not root.is_dir():
+            raise ValueError("local_folder must be an existing directory for push")
+        files = sorted(path for path in root.rglob("*") if path.is_file() and not path.is_symlink())
+        if len(files) > max_files:
+            raise ValueError(f"Transfer contains {len(files)} files; max_files is {max_files}")
+        total = sum(path.stat().st_size for path in files)
+        if total > max_total_bytes:
+            raise ValueError(
+                f"Transfer contains {total} bytes; max_total_bytes is {max_total_bytes}"
+            )
+        operation_started = time.monotonic()
+        session, lease = await self._operation_lease(name, lease_token)
+        lease_token = lease["lease_token"]
+        local_manifest = await asyncio.to_thread(_workspace_manifest, root, files)
+        local_by_relative = {
+            PurePosixPath(*path.relative_to(root).parts).as_posix(): path for path in files
+        }
+        heartbeat_stop = asyncio.Event()
+        heartbeat = asyncio.create_task(self._critical_heartbeat(session, heartbeat_stop))
+        bundle: Path | None = None
+        staging_path: str | None = None
+        staged_offset = 0
+        chunks_completed = 0
+        progress_count = 0
+        try:
+            manifest_started = time.monotonic()
+            remote = await self._remote_operation(
+                "workspace_manifest",
+                {
+                    "path": remote_folder,
+                    "max_files": max_files,
+                    "max_total_bytes": 10_000_000_000,
+                },
+                session.name,
+                lease_token=lease_token,
+            )
+            remote_by_relative = {item["path"]: item for item in remote["files"]}
+            changed = [
+                item
+                for item in local_manifest
+                if remote_by_relative.get(item["path"], {}).get("sha256") != item["sha256"]
+            ]
+            skipped = [
+                {
+                    "local_path": str(local_by_relative[item["path"]]),
+                    "remote_path": str(PurePosixPath(remote_folder) / item["path"]),
+                    "sha256": item["sha256"],
+                }
+                for item in local_manifest
+                if item not in changed
+            ]
+            manifest_seconds = time.monotonic() - manifest_started
+            if not changed:
+                return {
+                    "transfer_id": None,
+                    "files_transferred": [],
+                    "files_skipped": skipped,
+                    "total_bytes": total,
+                    "wire_bytes": 0,
+                    "compression": compression,
+                    "lease": lease,
+                    "progress_events_emitted": 0,
+                    "timings": {
+                        "assignment_lookup_seconds": lease["assignment_lookup_seconds"],
+                        "manifest_seconds": round(manifest_seconds, 3),
+                        "total_seconds": round(time.monotonic() - operation_started, 3),
+                    },
+                    "strategy": "verified_bundle_delta",
+                    "staging_cleanup": "no staging required",
+                }
+            bundle, codec, wire_bytes, wire_checksum = await asyncio.to_thread(
+                _build_workspace_bundle,
+                root,
+                local_by_relative,
+                changed,
+                compression,
+                compression_min_savings,
+            )
+            assert bundle is not None
+            logical_manifest = json.dumps(changed, sort_keys=True, separators=(",", ":"))
+            transfer_id = hashlib.sha256(
+                (remote_folder + "\0" + logical_manifest + "\0" + wire_checksum).encode()
+            ).hexdigest()[:32]
+            suffix = ".tar.gz" if codec == "gzip" else ".tar"
+            staging_path = f"/content/.colab-mcp/workspace.colab-mcp-wire-{transfer_id}{suffix}"
+            staged = await self._remote_stat_or_none(
+                staging_path,
+                session.name,
+                checksum=True,
+                lease_token=lease_token,
+            )
+            if staged:
+                staged_offset = int(staged["size"])
+                if staged_offset > wire_bytes:
+                    raise TransferError(
+                        "transfer_resume_conflict",
+                        "Remote workspace bundle is larger than this upload.",
+                        {"transfer_id": transfer_id, "staging_path": staging_path},
+                    )
+                prefix_digest = hashlib.sha256()
+                with bundle.open("rb") as handle:
+                    remaining = staged_offset
+                    while remaining:
+                        chunk = handle.read(min(1024 * 1024, remaining))
+                        prefix_digest.update(chunk)
+                        remaining -= len(chunk)
+                if prefix_digest.hexdigest() != staged["sha256"]:
+                    raise TransferError(
+                        "transfer_resume_conflict",
+                        "Remote workspace bundle differs from this source.",
+                        {"transfer_id": transfer_id, "staging_path": staging_path},
+                    )
+            transfer_started = time.monotonic()
+            with bundle.open("rb") as handle:
+                handle.seek(staged_offset)
+                while staged_offset < wire_bytes:
+                    chunk = handle.read(min(chunk_size, wire_bytes - staged_offset))
+                    result = await self._remote_operation(
+                        "transfer_upload_chunk",
+                        {
+                            "path": staging_path,
+                            "offset": staged_offset,
+                            "data_base64": base64.b64encode(chunk).decode(),
+                        },
+                        session.name,
+                        lease_token=lease_token,
+                    )
+                    staged_offset = int(result["offset"])
+                    chunks_completed += 1
+                    progress_count += 1
+                    if progress is not None:
+                        await progress(
+                            {
+                                "phase": "bundle_transfer",
+                                "transfer_id": transfer_id,
+                                "bytes_sent": staged_offset,
+                                "total_bytes": wire_bytes,
+                                "chunk_number": chunks_completed,
+                                "elapsed_seconds": round(time.monotonic() - operation_started, 3),
+                                "resumed": bool(result.get("already_applied")),
+                            }
+                        )
+            transfer_seconds = time.monotonic() - transfer_started
+            publication_started = time.monotonic()
+            published = await self._remote_operation(
+                "workspace_bundle_publish",
+                {
+                    "archive_path": staging_path,
+                    "workspace_path": remote_folder,
+                    "wire_sha256": wire_checksum,
+                    "compression": codec,
+                    "transfer_id": transfer_id,
+                    "max_files": max_files,
+                    "max_total_bytes": max_total_bytes,
+                },
+                session.name,
+                lease_token=lease_token,
+            )
+            publication_seconds = time.monotonic() - publication_started
+            transferred = [
+                {
+                    "local_path": str(local_by_relative[item["path"]]),
+                    "remote_path": str(PurePosixPath(remote_folder) / item["path"]),
+                    "size": item["size"],
+                    "sha256": item["sha256"],
+                    "compression": codec,
+                }
+                for item in published["files"]
+            ]
+            return {
+                "transfer_id": transfer_id,
+                "files_transferred": transferred,
+                "files_skipped": skipped,
+                "total_bytes": total,
+                "wire_bytes": wire_bytes,
+                "compression": codec,
+                "lease": lease,
+                "progress_events_emitted": progress_count,
+                "timings": {
+                    "assignment_lookup_seconds": lease["assignment_lookup_seconds"],
+                    "manifest_seconds": round(manifest_seconds, 3),
+                    "data_transfer_seconds": round(transfer_seconds, 3),
+                    "publication_seconds": round(publication_seconds, 3),
+                    "total_seconds": round(time.monotonic() - operation_started, 3),
+                },
+                "strategy": "verified_bundle_delta",
+                "staging_cleanup": "published bundle removed; failed bundle preserved for resume",
+            }
+        except Exception as error:
+            if isinstance(error, (TransferError, OperationLeaseError, RuntimeReplacedError)):
+                raise
+            code = getattr(error, "code", "transfer_failed_staging_preserved")
+            raise TransferError(
+                code,
+                str(error),
+                {
+                    "session": session.name,
+                    "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+                    "staging_path": staging_path,
+                    "staged_bytes": staged_offset,
+                    "chunks_completed": chunks_completed,
+                    "request_submission": (
+                        "not_submitted"
+                        if isinstance(error, KernelConnectionError)
+                        else "unknown_after_error"
+                    ),
+                    "safe_to_resume": staging_path is not None,
+                    "resume_requires_same_incarnation": True,
+                },
+            ) from error
+        finally:
+            if bundle is not None:
+                bundle.unlink(missing_ok=True)
+            heartbeat_stop.set()
+            await asyncio.gather(heartbeat, return_exceptions=True)
 
     async def transfer_upload(
         self,

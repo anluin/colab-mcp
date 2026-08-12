@@ -236,16 +236,16 @@ The handoff deadline is best-effort because each Colab kernel status/output roun
 it is not a hard real-time deadline.
 
 `colab_workspace_sync` is the only public general file-transfer tool. It accepts complete local and
-remote directory roots with `direction="push"` or `direction="pull"`. It skips identical SHA-256
-content, updates changed files through staging and atomic publication, and never deletes
-destination-only files. The underlying bounded transfer engine remains private so agents cannot
-shuttle individual bytes or mutate arbitrary runtime files through MCP.
-Transfers use per-file gzip on the wire by default when a file is at least 1 MiB and its measured
-compressed representation is at least 10% smaller. Set `compression="gzip"` to force gzip or
-`compression="none"` to send original bytes. Compression is streamed, original and wire SHA-256
-values are verified, and results distinguish logical `total_bytes` from `wire_bytes` and report the
-actual codec per file. Directories remain independently resumable files rather than one archive;
-already-compressed or high-entropy files therefore stay uncompressed in `auto` mode.
+remote directory roots with `direction="push"` or `direction="pull"`. Push computes one remote
+manifest, packs only changed files into a deterministic bundle, transfers that bundle in bounded
+resumable chunks, verifies every declared path, size, and SHA-256 value before publication, and
+atomically replaces each changed file. A no-change push needs one remote round trip. Destination-only
+files are never deleted. Pull retains the bounded per-file recovery path. The underlying transfer
+engines remain private so agents cannot shuttle individual bytes or mutate arbitrary runtime files
+through MCP.
+Transfers use gzip when the measured bundle or file is at least 10% smaller. Set
+`compression="gzip"` to force gzip or `compression="none"` to send original bytes. Original and
+wire SHA-256 values are verified, and results distinguish logical `total_bytes` from `wire_bytes`.
 
 `colab_allocation_probe` returns an opaque, one-hour `lease_token` bound to the tracked endpoint and
 runtime fingerprint both locally and inside that runtime. Pass it to a transfer or process start to
@@ -290,10 +290,14 @@ idempotent when a tracked runtime has already disappeared.
 
 1. Check `colab_health`.
 2. Start with a T4 unless another accelerator is required.
-3. Create or execute a notebook.
-4. Pull the complete artifact folder with `colab_workspace_sync`.
-5. Pause to checkpoint and release compute, or stop when finished.
-6. Always stop a runtime after an error if it was not already released.
+3. Build a temporary local source snapshot containing only required tracked source, configuration,
+   and inputs; exclude VCS metadata, caches, environments, and historical outputs.
+4. Push it to `/content/workspaces/<task>/source` and write results only under the sibling
+   `/content/workspaces/<task>/artifacts` directory.
+5. Create or execute a notebook or durable process.
+6. Pull only the artifact folder with `colab_workspace_sync`.
+7. Pause to checkpoint and release compute, or stop when finished.
+8. Always stop a runtime after an error if it was not already released.
 
 ## Pause and resume semantics
 

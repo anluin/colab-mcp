@@ -82,6 +82,8 @@ def test_process_output_reconciles_exit_count_with_live_spool_size():
     [
         "incarnation_init",
         "lease_probe",
+        "workspace_manifest",
+        "workspace_bundle_publish",
         "process_start",
         "process_status",
         "process_list",
@@ -158,6 +160,16 @@ def test_operation_lease_is_validated_inside_same_remote_request_before_chunk_mu
     )
     assert "transfer_offset_conflict" in code
     assert "already_applied" in code
+
+
+def test_workspace_bundle_publish_rejects_unsafe_or_undeclared_members():
+    code = build_remote_code("workspace_bundle_publish", {})
+    assert "workspace bundle path escapes its root" in code
+    assert "workspace bundle contains undeclared members" in code
+    assert "workspace bundle content checksum mismatch" in code
+    assert code.index("workspace bundle content checksum mismatch") < code.index(
+        "_cm_staged_file.replace(_cm_destination)"
+    )
 
 
 @pytest.mark.parametrize("argv", [[], [""], [1]])
