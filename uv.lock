@@ -303,6 +303,7 @@ dependencies = [
     { name = "google-colab-cli" },
     { name = "mcp" },
     { name = "pydantic-settings" },
+    { name = "requests" },
 ]
 
 [package.dev-dependencies]
@@ -319,6 +320,7 @@ requires-dist = [
     { name = "google-colab-cli", specifier = "==0.6.0" },
     { name = "mcp", specifier = ">=1.29,<2" },
     { name = "pydantic-settings", specifier = "<2.15" },
+    { name = "requests", specifier = ">=2.32,<3" },
 ]
 
 [package.metadata.requires-dev]

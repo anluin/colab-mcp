@@ -13,10 +13,12 @@ walks caches, VCS metadata, historical checkpoints, or unrelated outputs.
 2. Otherwise call `colab_start`, then `colab_inspect` and `colab_allocation_probe`.
 3. Pass the probe lease immediately to critical work. Never follow a changed fingerprint.
 4. Create a temporary local source snapshot containing every file the workload needs and nothing
-   else. Prefer tracked source plus required configs/data; exclude `.git`, caches, environments,
-   prior outputs, and checkpoints unless the run consumes them.
+   else. MUST NOT sync a repository root, home, model cache, environment, or mixed output tree.
+   Prefer tracked source plus required configs/data; fetch public models and datasets directly on
+   Colab instead of routing them through the local machine.
 5. Push that snapshot to a task-specific root such as `/content/workspaces/<task>/source`.
-   Reserve `/content/workspaces/<task>/artifacts` for outputs only.
+   Reserve `/content/workspaces/<task>/artifacts` for outputs only. For large or uncertain changes,
+   inspect `dry_run=true`, then execute with its `plan_id` as `expected_plan_id`.
 6. For work expected to finish quickly, use `colab_execute` or `colab_run_command`.
 7. For uncertain or long work, use `colab_process_start` with `export_on_exit` targeting the
    dedicated artifact directory. Poll status and output with increasing intervals. A timeout does

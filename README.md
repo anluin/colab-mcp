@@ -235,8 +235,10 @@ complete byte count, including discarded bytes, and `total_bytes_final=true`.
 The handoff deadline is best-effort because each Colab kernel status/output round-trip has latency;
 it is not a hard real-time deadline.
 
-`colab_workspace_sync` is the only public general file-transfer tool. It accepts complete local and
-remote directory roots with `direction="push"` or `direction="pull"`. Push computes one remote
+`colab_workspace_sync` is the only public general file-transfer tool. It accepts purposeful local
+and remote directory roots with `direction="push"` or `direction="pull"`. Agents should build a
+temporary staging directory containing only the run's required filesâ€”never naively select a whole
+repository, home directory, environment, cache, or mixed output tree. Push computes one remote
 manifest, packs only changed files into a deterministic bundle, transfers that bundle in bounded
 resumable chunks, verifies every declared path, size, and SHA-256 value before publication, and
 atomically replaces each changed file. A no-change push needs one remote round trip. Destination-only
@@ -246,6 +248,19 @@ through MCP.
 Transfers use gzip when the measured bundle or file is at least 10% smaller. Set
 `compression="gzip"` to force gzip or `compression="none"` to send original bytes. Original and
 wire SHA-256 values are verified, and results distinguish logical `total_bytes` from `wire_bytes`.
+In `auto` mode, already-compressed image, audio, video, and archive formats bypass the expensive
+gzip trial pass. `colab_workspace_sync` is the single supported upload/download API;
+its direction selects push or pull while process export remains a lifecycle-specific operation.
+Bulk uploads stream native binary buffers over the authenticated kernel websocket; downloads use
+Jupyter's authenticated raw-files endpoint. Kernel execution is used only to establish the guarded
+receiver and publish verified staging, not to carry file bytes.
+
+An optional positive `include` list selects relative POSIX-glob paths after mandatory exclusions
+for VCS data, environments, caches, and common secret-key files. `dry_run=true` returns an immutable
+`plan_id`, bounded changed/excluded/destination-only previews, reason codes, byte totals, and an
+estimated MiB/s range derived only from observed transfers. Until history exists, it reports
+`insufficient_history` instead of inventing a speed. Execute with that ID as `expected_plan_id`;
+the server rejects drift with `sync_plan_changed`. Dry runs never stage, transfer, or publish files.
 
 `colab_allocation_probe` returns an opaque, one-hour `lease_token` bound to the tracked endpoint and
 runtime fingerprint both locally and inside that runtime. Pass it to a transfer or process start to
@@ -291,8 +306,10 @@ idempotent when a tracked runtime has already disappeared.
 1. Check `colab_health`.
 2. Start with a T4 unless another accelerator is required.
 3. Build a temporary local source snapshot containing only required tracked source, configuration,
-   and inputs; exclude VCS metadata, caches, environments, and historical outputs.
-4. Push it to `/content/workspaces/<task>/source` and write results only under the sibling
+   and private inputs; fetch public datasets and model weights directly on Colab. Never sync the
+   repository root, VCS metadata, caches, environments, or historical outputs.
+4. Dry-run uncertain or large changes, then sync with its `expected_plan_id`. Push to
+   `/content/workspaces/<task>/source` and write results only under the sibling
    `/content/workspaces/<task>/artifacts` directory.
 5. Create or execute a notebook or durable process.
 6. Pull only the artifact folder with `colab_workspace_sync`.

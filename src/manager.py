@@ -9,6 +9,7 @@ import hashlib
 import io
 import json
 import logging
+import math
 import os
 import shutil
 import tarfile
@@ -20,8 +21,10 @@ import zlib
 from collections.abc import Awaitable, Callable
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
+from urllib.parse import quote
 
 import nbformat
+import requests
 from colab_cli.auth import TOKEN_CONFIG_PATH, AuthProvider, get_credentials
 from colab_cli.client import Accelerator, Client, Prod, Variant
 from colab_cli.state import SessionState, StateStore
@@ -30,7 +33,7 @@ from google.oauth2.credentials import Credentials
 from nbformat.v4 import new_output
 from pydantic import BaseModel, Field, field_validator
 
-from .colab_adapter import kernel_client
+from .colab_adapter import binary_upload, kernel_client
 from .remote import (
     DEFAULT_OUTPUT_LIMIT,
     DEFAULT_PROCESS_OUTPUT_LIMIT,
@@ -49,11 +52,59 @@ from .remote import (
 GPU_TYPES = {"T4", "L4", "G4", "H100", "A100"}
 COMPUTE_UNITS_URL = "https://colab.research.google.com/signup"
 MAX_TRANSFER_CHUNK = 2_000_000
+ALREADY_COMPRESSED_SUFFIXES = frozenset(
+    {
+        ".7z",
+        ".aac",
+        ".avif",
+        ".avi",
+        ".flac",
+        ".gif",
+        ".gz",
+        ".heic",
+        ".heif",
+        ".jpeg",
+        ".jpg",
+        ".m4a",
+        ".m4v",
+        ".mkv",
+        ".mov",
+        ".mp3",
+        ".mp4",
+        ".mpeg",
+        ".mpg",
+        ".ogg",
+        ".opus",
+        ".png",
+        ".rar",
+        ".webm",
+        ".webp",
+        ".wmv",
+        ".zip",
+    }
+)
 # Colab's runtime proxy regularly needs more than five seconds to establish a
 # fresh websocket even when the allocation is healthy.  Keep the phase bounded,
 # but allow enough time for normal cross-region cold/reconnect latency.
 LEASED_CONNECTION_TIMEOUT_SECONDS = 20
 logger = logging.getLogger("colab_mcp.manager")
+
+SYNC_ALWAYS_EXCLUDED = (
+    ".git/**",
+    ".venv/**",
+    "venv/**",
+    "node_modules/**",
+    "**/__pycache__/**",
+    ".pytest_cache/**",
+    ".mypy_cache/**",
+    ".ruff_cache/**",
+    ".env",
+    ".env.*",
+    "**/*.key",
+    "**/*.pem",
+)
+SYNC_PLAN_VERSION = 1
+SYNC_PLAN_PREVIEW_LIMIT = 200
 
 
 class AutoExportRule(BaseModel):
@@ -385,6 +436,71 @@ def _use_compressed_wire(
     )
 
 
+def _auto_compression_candidate(path: Path | PurePosixPath) -> bool:
+    """Avoid full gzip trial passes for formats that are already compressed."""
+    return path.suffix.lower() not in ALREADY_COMPRESSED_SUFFIXES
+
+
+def _raw_download_to_file(
+    session: Any,
+    remote_path: str,
+    destination: Path,
+    codec: str,
+    content_bytes: int,
+    wire_bytes: int,
+    wire_checksum: str,
+    content_checksum: str,
+    max_total_bytes: int,
+    chunk_size: int,
+) -> None:
+    """Stream authenticated raw bytes from Jupyter's files endpoint."""
+    quoted = quote(remote_path.strip("/"), safe="/")
+    url = session.url.rstrip("/") + "/files/" + quoted
+    response = requests.get(
+        url,
+        params={"authuser": "0", "colab-runtime-proxy-token": session.token},
+        headers={
+            "X-Colab-Client-Agent": "colab-mcp",
+            "X-Colab-Runtime-Proxy-Token": session.token,
+        },
+        stream=True,
+        timeout=(30, 120),
+    )
+    response.raise_for_status()
+    wire_digest = hashlib.sha256()
+    content_digest = hashlib.sha256()
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if codec == "gzip" else None
+    wire_read = 0
+    content_written = 0
+    with destination.open("wb") as handle:
+        for wire_data in response.iter_content(chunk_size):
+            if not wire_data:
+                continue
+            wire_read += len(wire_data)
+            if wire_read > wire_bytes:
+                raise RuntimeError("Raw download exceeded declared wire size")
+            wire_digest.update(wire_data)
+            content_data = decompressor.decompress(wire_data) if decompressor else wire_data
+            content_written += len(content_data)
+            if content_written > content_bytes or content_written > max_total_bytes:
+                raise RuntimeError("Decompressed transfer exceeded declared size bound")
+            content_digest.update(content_data)
+            handle.write(content_data)
+        if decompressor:
+            final_data = decompressor.flush()
+            content_written += len(final_data)
+            content_digest.update(final_data)
+            handle.write(final_data)
+            if not decompressor.eof:
+                raise RuntimeError("Compressed transfer ended before the gzip stream")
+        handle.flush()
+        os.fsync(handle.fileno())
+    if wire_read != wire_bytes or wire_digest.hexdigest() != wire_checksum:
+        raise RuntimeError("Raw download wire checksum mismatch")
+    if content_written != content_bytes or content_digest.hexdigest() != content_checksum:
+        raise RuntimeError("Raw download content checksum mismatch")
+
+
 def _workspace_manifest(root: Path, files: list[Path]) -> list[dict[str, Any]]:
     return [
         {
@@ -394,6 +510,70 @@ def _workspace_manifest(root: Path, files: list[Path]) -> list[dict[str, Any]]:
         }
         for path in files
     ]
+
+
+def _sync_pattern_matches(path: str, pattern: str) -> bool:
+    """Match normalized POSIX paths with a small, predictable git-style subset."""
+    pattern = pattern.strip().replace("\\", "/").lstrip("/")
+    if not pattern or ".." in PurePosixPath(pattern).parts:
+        raise ValueError(f"Invalid sync include pattern: {pattern!r}")
+    candidate = PurePosixPath(path)
+    if pattern.startswith("**/") and pattern.endswith("/**"):
+        directory = pattern[3:-3].strip("/")
+        return (
+            path == directory or path.startswith(directory + "/") or f"/{directory}/" in f"/{path}/"
+        )
+    if pattern.endswith("/**"):
+        prefix = pattern[:-3].rstrip("/")
+        return path == prefix or path.startswith(prefix + "/")
+    return candidate.match(pattern) or ("/" not in pattern and candidate.name == pattern)
+
+
+def _sync_selected(path: str, include: tuple[str, ...]) -> tuple[bool, str | None]:
+    for pattern in SYNC_ALWAYS_EXCLUDED:
+        if _sync_pattern_matches(path, pattern):
+            return False, f"built_in:{pattern}"
+    if include and not any(_sync_pattern_matches(path, pattern) for pattern in include):
+        return False, "not_in_include"
+    return True, None
+
+
+def _sync_plan_id(payload: dict[str, Any]) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _sync_diff(
+    source: list[dict[str, Any]], destination: list[dict[str, Any]], preview_limit: int
+) -> dict[str, Any]:
+    destination_by_path = {item["path"]: item for item in destination}
+    source_paths = {item["path"] for item in source}
+    changed: list[dict[str, Any]] = []
+    unchanged = 0
+    transfer_bytes = 0
+    for item in source:
+        previous = destination_by_path.get(item["path"])
+        if previous is None:
+            reason = "destination_missing"
+        elif int(previous.get("size", -1)) != int(item["size"]):
+            reason = "size_changed"
+        elif previous.get("sha256") != item["sha256"]:
+            reason = "content_changed"
+        else:
+            unchanged += 1
+            continue
+        changed.append({**item, "reason": reason})
+        transfer_bytes += int(item["size"])
+    destination_only = sorted(path for path in destination_by_path if path not in source_paths)
+    return {
+        "files_to_transfer": changed[:preview_limit],
+        "files_truncated": max(0, len(changed) - preview_limit),
+        "files_to_transfer_count": len(changed),
+        "unchanged_count": unchanged,
+        "destination_only_count": len(destination_only),
+        "destination_only": destination_only[:preview_limit],
+        "transfer_bytes": transfer_bytes,
+    }
 
 
 def _build_workspace_bundle(
@@ -426,7 +606,13 @@ def _build_workspace_bundle(
                     bundle.addfile(info, handle)
         codec = "none"
         wire = archive
-        if compression != "none":
+        should_try_compression = compression == "gzip" or (
+            compression == "auto"
+            and any(
+                _auto_compression_candidate(files_by_relative[item["path"]]) for item in manifest
+            )
+        )
+        if should_try_compression:
             candidate, candidate_size, _ = _gzip_local_file(archive)
             if _use_compressed_wire(
                 compression, archive.stat().st_size, candidate_size, compression_min_savings
@@ -534,6 +720,7 @@ class ColabManager:
         self.store = SecureStateStore(str(config_dir / "sessions.json"))
         self.process_journal = ProcessJournal(config_dir / "processes.json")
         self.suspended_path = config_dir / "suspended.json"
+        self.sync_history_path = config_dir / "sync-throughput.json"
         self._suspended_lock = threading.Lock()
         self.auth_provider = AuthProvider(os.environ.get("COLAB_MCP_AUTH", "oauth2"))
         self.oauth_config = os.environ.get("COLAB_MCP_OAUTH_CONFIG")
@@ -552,6 +739,64 @@ class ColabManager:
         self.keepalive_seconds = int(os.environ.get("COLAB_MCP_KEEPALIVE_SECONDS", "60"))
         self._export_watchers: dict[tuple[str, str], asyncio.Task] = {}
         self.export_poll_seconds = float(os.environ.get("COLAB_MCP_EXPORT_POLL_SECONDS", "5"))
+
+    def _sync_speed_estimate(self, direction: str, transfer_bytes: int) -> dict[str, Any]:
+        samples: list[float] = []
+        try:
+            records = json.loads(self.sync_history_path.read_text(encoding="utf-8"))
+            samples = [
+                float(item["mib_per_second"])
+                for item in records
+                if item.get("direction") == direction and float(item.get("mib_per_second", 0)) > 0
+            ][-20:]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            pass
+        if not samples:
+            return {
+                "status": "insufficient_history",
+                "estimated_seconds": None,
+                "estimated_mib_per_second": None,
+            }
+        ordered = sorted(samples)
+        low = ordered[max(0, math.floor((len(ordered) - 1) * 0.2))]
+        typical = ordered[len(ordered) // 2]
+        high = ordered[min(len(ordered) - 1, math.ceil((len(ordered) - 1) * 0.8))]
+        mib = transfer_bytes / (1024 * 1024)
+        return {
+            "status": "estimated_from_observed_transfers",
+            "sample_count": len(samples),
+            "estimated_mib_per_second": round(typical, 2),
+            "range_mib_per_second": [round(low, 2), round(high, 2)],
+            "estimated_seconds": round(mib / typical, 2) if typical else None,
+            "range_seconds": [
+                round(mib / high, 2) if high else None,
+                round(mib / low, 2) if low else None,
+            ],
+        }
+
+    def _record_sync_speed(self, direction: str, wire_bytes: int, seconds: float) -> None:
+        if wire_bytes <= 0 or seconds <= 0:
+            return
+        try:
+            records = json.loads(self.sync_history_path.read_text(encoding="utf-8"))
+            if not isinstance(records, list):
+                records = []
+        except (OSError, json.JSONDecodeError):
+            records = []
+        records.append(
+            {
+                "direction": direction,
+                "mib_per_second": wire_bytes / (1024 * 1024) / seconds,
+                "wire_bytes": wire_bytes,
+                "seconds": seconds,
+                "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
+        temporary = self.sync_history_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records[-40:], indent=2), encoding="utf-8")
+        _secure_permissions(temporary, 0o600)
+        temporary.replace(self.sync_history_path)
+        _secure_permissions(self.sync_history_path, 0o600)
 
     def _kernel_lock(self, name: str) -> asyncio.Lock:
         with self._kernel_clients_guard:
@@ -1978,6 +2223,82 @@ class ColabManager:
             "inspect", {"tools": tools, "process_limit": process_limit}, name
         )
 
+    async def _binary_upload_file(
+        self,
+        source: Path,
+        remote_path: str,
+        offset: int,
+        session: ManagedSessionState,
+        lease_token: str,
+        timeout: float = 900,
+    ) -> dict[str, Any]:
+        """Upload through one native-buffer websocket stream under the operation lease."""
+
+        def connect_and_upload() -> dict[str, Any]:
+            kernel = self._cached_kernel(session.name)
+            try:
+                if kernel is None:
+                    kernel = kernel_client(
+                        connection_timeout=LEASED_CONNECTION_TIMEOUT_SECONDS,
+                        server_url=session.url,
+                        proxy_token=session.token,
+                        kernel_id=session.kernel_id,
+                        client_kwargs={
+                            "extra_params": {"colab-runtime-proxy-token": session.token}
+                        },
+                    )
+                    kernel.start(timeout=LEASED_CONNECTION_TIMEOUT_SECONDS)
+                    if not session.kernel_id and kernel.id:
+                        session.kernel_id = kernel.id
+                        self.store.add(session)
+                    self._cache_kernel(session.name, kernel)
+                return binary_upload(
+                    kernel,
+                    source,
+                    remote_path,
+                    offset,
+                    session.runtime_fingerprint or "",
+                    lease_token,
+                    timeout,
+                )
+            except BaseException:
+                if kernel is not None:
+                    self._stop_kernel_safely(kernel)
+                with self._kernel_clients_guard:
+                    if self._kernel_clients.get(session.name) is kernel:
+                        self._kernel_clients.pop(session.name, None)
+                raise
+
+        async with self._kernel_lock(session.name):
+            return await asyncio.to_thread(connect_and_upload)
+
+    async def _raw_download_file(
+        self,
+        session: ManagedSessionState,
+        remote_path: str,
+        destination: Path,
+        codec: str,
+        content_bytes: int,
+        wire_bytes: int,
+        wire_checksum: str,
+        content_checksum: str,
+        max_total_bytes: int,
+        chunk_size: int,
+    ) -> None:
+        await asyncio.to_thread(
+            _raw_download_to_file,
+            session,
+            remote_path,
+            destination,
+            codec,
+            content_bytes,
+            wire_bytes,
+            wire_checksum,
+            content_checksum,
+            max_total_bytes,
+            chunk_size,
+        )
+
     async def _remote_stat_or_none(
         self,
         path: str,
@@ -1999,6 +2320,114 @@ class ColabManager:
                 return None
             raise
 
+    async def workspace_sync_plan(
+        self,
+        direction: Literal["push", "pull"],
+        local_folder: str,
+        remote_folder: str,
+        name: str | None,
+        include: list[str] | None = None,
+        max_files: int = 10_000,
+        max_total_bytes: int = 1_000_000_000,
+        lease_token: str | None = None,
+        preview_limit: int = SYNC_PLAN_PREVIEW_LIMIT,
+    ) -> tuple[dict[str, Any], list[str], list[str], str, dict[str, Any]]:
+        """Build the authoritative, side-effect-free plan used by workspace sync."""
+        if preview_limit < 1 or preview_limit > 1_000:
+            raise ValueError("preview_limit must be between 1 and 1000")
+        normalized_include = tuple(dict.fromkeys(include or ()))
+        if len(normalized_include) > 100:
+            raise ValueError("include accepts at most 100 patterns")
+        session, lease = await self._operation_lease(name, lease_token)
+        lease_token = lease["lease_token"]
+        local_root = Path(local_folder).expanduser().resolve()
+        if direction == "push" and not local_root.is_dir():
+            raise ValueError("local_folder must be an existing directory for push")
+
+        remote = await self._remote_operation(
+            "workspace_manifest",
+            {
+                "path": remote_folder,
+                "max_files": max_files,
+                "max_total_bytes": 10_000_000_000,
+                "include": list(normalized_include),
+                "exclude": list(SYNC_ALWAYS_EXCLUDED),
+            },
+            session.name,
+            lease_token=lease_token,
+        )
+        if "files" not in remote:
+            raise ValueError("remote_folder must be an existing directory")
+        remote_manifest = remote["files"]
+        local_candidates = (
+            sorted(
+                path for path in local_root.rglob("*") if path.is_file() and not path.is_symlink()
+            )
+            if local_root.is_dir()
+            else []
+        )
+        local_files: list[Path] = []
+        local_excluded: list[dict[str, str]] = []
+        for path in local_candidates:
+            relative = PurePosixPath(*path.relative_to(local_root).parts).as_posix()
+            accepted, reason = _sync_selected(relative, normalized_include)
+            if accepted:
+                local_files.append(path)
+            else:
+                local_excluded.append({"path": relative, "reason": reason or "excluded"})
+        local_manifest = await asyncio.to_thread(_workspace_manifest, local_root, local_files)
+        source_all = local_manifest if direction == "push" else remote_manifest
+        destination = remote_manifest if direction == "push" else local_manifest
+        selected = source_all
+        excluded = local_excluded if direction == "push" else remote.get("excluded", [])
+        if not selected:
+            raise ValueError(
+                "Sync selection is empty; adjust local_folder, remote_folder, or include"
+            )
+        if len(selected) > max_files:
+            raise ValueError(
+                f"Sync selection contains {len(selected)} files; max_files is {max_files}"
+            )
+        selected_bytes = sum(int(item["size"]) for item in selected)
+        if selected_bytes > max_total_bytes:
+            raise ValueError(
+                f"Sync selection contains {selected_bytes} bytes; max_total_bytes is {max_total_bytes}"
+            )
+        diff = _sync_diff(selected, destination, preview_limit)
+        identity = {
+            "version": SYNC_PLAN_VERSION,
+            "direction": direction,
+            "local_folder": str(local_root),
+            "remote_folder": remote_folder,
+            "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
+            "include": normalized_include,
+            "source": selected,
+            "destination": destination,
+        }
+        plan = {
+            "plan_id": _sync_plan_id(identity),
+            "direction": direction,
+            "local_folder": str(local_root),
+            "remote_folder": remote_folder,
+            "include": list(normalized_include),
+            "always_excluded": list(SYNC_ALWAYS_EXCLUDED),
+            "selected_count": len(selected),
+            "selected_bytes": selected_bytes,
+            "excluded_count": len(excluded),
+            "excluded": excluded[:preview_limit],
+            "excluded_truncated": max(0, len(excluded) - preview_limit),
+            "estimated_wire_bytes": diff["transfer_bytes"],
+            "speed_estimate": self._sync_speed_estimate(direction, diff["transfer_bytes"]),
+            **diff,
+        }
+        destination_hashes = {item["path"]: item.get("sha256") for item in destination}
+        changed_paths = [
+            item["path"]
+            for item in selected
+            if destination_hashes.get(item["path"]) != item["sha256"]
+        ]
+        return plan, [item["path"] for item in selected], changed_paths, session.name, lease
+
     async def workspace_upload(
         self,
         local_folder: str,
@@ -2011,6 +2440,8 @@ class ColabManager:
         compression_min_savings: float = 0.10,
         lease_token: str | None = None,
         progress: ProgressCallback | None = None,
+        selected_paths: set[str] | None = None,
+        changed_paths: set[str] | None = None,
     ) -> dict[str, Any]:
         """Push a directory delta as one verified bundle instead of per-file RPCs."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
@@ -2021,6 +2452,12 @@ class ColabManager:
         if not root.is_dir():
             raise ValueError("local_folder must be an existing directory for push")
         files = sorted(path for path in root.rglob("*") if path.is_file() and not path.is_symlink())
+        if selected_paths is not None:
+            files = [
+                path
+                for path in files
+                if PurePosixPath(*path.relative_to(root).parts).as_posix() in selected_paths
+            ]
         if len(files) > max_files:
             raise ValueError(f"Transfer contains {len(files)} files; max_files is {max_files}")
         total = sum(path.stat().st_size for path in files)
@@ -2044,22 +2481,27 @@ class ColabManager:
         progress_count = 0
         try:
             manifest_started = time.monotonic()
-            remote = await self._remote_operation(
-                "workspace_manifest",
-                {
-                    "path": remote_folder,
-                    "max_files": max_files,
-                    "max_total_bytes": 10_000_000_000,
-                },
-                session.name,
-                lease_token=lease_token,
-            )
-            remote_by_relative = {item["path"]: item for item in remote["files"]}
-            changed = [
-                item
-                for item in local_manifest
-                if remote_by_relative.get(item["path"], {}).get("sha256") != item["sha256"]
-            ]
+            if changed_paths is None:
+                remote = await self._remote_operation(
+                    "workspace_manifest",
+                    {
+                        "path": remote_folder,
+                        "max_files": max_files,
+                        "max_total_bytes": 10_000_000_000,
+                        "include": sorted(selected_paths) if selected_paths is not None else [],
+                        "exclude": list(SYNC_ALWAYS_EXCLUDED),
+                    },
+                    session.name,
+                    lease_token=lease_token,
+                )
+                remote_by_relative = {item["path"]: item for item in remote["files"]}
+                changed = [
+                    item
+                    for item in local_manifest
+                    if remote_by_relative.get(item["path"], {}).get("sha256") != item["sha256"]
+                ]
+            else:
+                changed = [item for item in local_manifest if item["path"] in changed_paths]
             skipped = [
                 {
                     "local_path": str(local_by_relative[item["path"]]),
@@ -2131,35 +2573,27 @@ class ColabManager:
                         {"transfer_id": transfer_id, "staging_path": staging_path},
                     )
             transfer_started = time.monotonic()
-            with bundle.open("rb") as handle:
-                handle.seek(staged_offset)
-                while staged_offset < wire_bytes:
-                    chunk = handle.read(min(chunk_size, wire_bytes - staged_offset))
-                    result = await self._remote_operation(
-                        "transfer_upload_chunk",
-                        {
-                            "path": staging_path,
-                            "offset": staged_offset,
-                            "data_base64": base64.b64encode(chunk).decode(),
-                        },
-                        session.name,
-                        lease_token=lease_token,
-                    )
-                    staged_offset = int(result["offset"])
-                    chunks_completed += 1
-                    progress_count += 1
-                    if progress is not None:
-                        await progress(
-                            {
-                                "phase": "bundle_transfer",
-                                "transfer_id": transfer_id,
-                                "bytes_sent": staged_offset,
-                                "total_bytes": wire_bytes,
-                                "chunk_number": chunks_completed,
-                                "elapsed_seconds": round(time.monotonic() - operation_started, 3),
-                                "resumed": bool(result.get("already_applied")),
-                            }
-                        )
+            resumed_from = staged_offset
+            result = await self._binary_upload_file(
+                bundle, staging_path, staged_offset, session, lease_token
+            )
+            staged_offset = int(result["offset"])
+            if staged_offset != wire_bytes or result["sha256"] != wire_checksum:
+                raise RuntimeError("Binary workspace upload checksum mismatch")
+            chunks_completed = 1
+            progress_count = 1
+            if progress is not None:
+                await progress(
+                    {
+                        "phase": "bundle_transfer",
+                        "transfer_id": transfer_id,
+                        "bytes_sent": staged_offset,
+                        "total_bytes": wire_bytes,
+                        "chunk_number": chunks_completed,
+                        "elapsed_seconds": round(time.monotonic() - operation_started, 3),
+                        "resumed": resumed_from > 0,
+                    }
+                )
             transfer_seconds = time.monotonic() - transfer_started
             publication_started = time.monotonic()
             published = await self._remote_operation(
@@ -2331,7 +2765,9 @@ class ColabManager:
                     wire_checksum = checksum
                     codec = "none"
                     if compression == "gzip" or (
-                        compression == "auto" and content_bytes >= compression_min_bytes
+                        compression == "auto"
+                        and content_bytes >= compression_min_bytes
+                        and _auto_compression_candidate(source_file)
                     ):
                         candidate, candidate_bytes, candidate_checksum = await asyncio.to_thread(
                             _gzip_local_file, source_file
@@ -2393,39 +2829,27 @@ class ColabManager:
                                 },
                             )
                     transfer_started = time.monotonic()
-                    with wire_source.open("rb") as handle:
-                        handle.seek(staged_offset)
-                        while staged_offset < wire_bytes:
-                            chunk = handle.read(min(chunk_size, wire_bytes - staged_offset))
-                            chunk_number = staged_offset // chunk_size + 1
-                            chunk_started = time.monotonic()
-                            result = await self._remote_operation(
-                                "transfer_upload_chunk",
-                                {
-                                    "path": wire_temporary,
-                                    "offset": staged_offset,
-                                    "data_base64": base64.b64encode(chunk).decode(),
-                                },
-                                session.name,
-                                lease_token=lease_token,
-                            )
-                            staged_offset = int(result["offset"])
-                            chunks_completed += 1
-                            await report(
-                                {
-                                    "phase": "transfer",
-                                    "transfer_id": transfer_id,
-                                    "file": relative.as_posix(),
-                                    "bytes_sent": staged_offset,
-                                    "total_bytes": wire_bytes,
-                                    "chunk_number": int(chunk_number),
-                                    "chunk_seconds": round(time.monotonic() - chunk_started, 3),
-                                    "elapsed_seconds": round(
-                                        time.monotonic() - operation_started, 3
-                                    ),
-                                    "resumed": bool(result.get("already_applied")),
-                                }
-                            )
+                    resumed_from = staged_offset
+                    result = await self._binary_upload_file(
+                        wire_source, wire_temporary, staged_offset, session, lease_token
+                    )
+                    staged_offset = int(result["offset"])
+                    if staged_offset != wire_bytes or result["sha256"] != wire_checksum:
+                        raise RuntimeError(f"Wire checksum mismatch while uploading {source_file}")
+                    chunks_completed += 1
+                    await report(
+                        {
+                            "phase": "transfer",
+                            "transfer_id": transfer_id,
+                            "file": relative.as_posix(),
+                            "bytes_sent": staged_offset,
+                            "total_bytes": wire_bytes,
+                            "chunk_number": chunks_completed,
+                            "chunk_seconds": round(float(result["seconds"]), 3),
+                            "elapsed_seconds": round(time.monotonic() - operation_started, 3),
+                            "resumed": resumed_from > 0,
+                        }
+                    )
                     phase_timings["data_transfer_seconds"] = round(
                         phase_timings.get("data_transfer_seconds", 0.0)
                         + time.monotonic()
@@ -2628,6 +3052,7 @@ class ColabManager:
         compression_min_bytes: int = 1_048_576,
         compression_min_savings: float = 0.10,
         lease_token: str | None = None,
+        selected_paths: set[str] | None = None,
     ) -> dict[str, Any]:
         """Download files through checksummed chunks and atomic local replacement."""
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
@@ -2637,10 +3062,21 @@ class ColabManager:
         operation_started = time.monotonic()
         session, lease = await self._operation_lease(name, lease_token)
         lease_token = lease["lease_token"]
-        last_heartbeat = time.monotonic()
         root, files = await self._remote_files(
             remote_path, session.name, max_files, lease_token=lease_token
         )
+        remote_root = PurePosixPath(root["path"])
+        if selected_paths is not None:
+            files = [
+                item
+                for item in files
+                if (
+                    PurePosixPath(item["path"]).relative_to(remote_root).as_posix()
+                    if root["kind"] == "directory"
+                    else PurePosixPath(item["path"]).name
+                )
+                in selected_paths
+            ]
         total = sum(int(item["size"]) for item in files)
         if total > max_total_bytes:
             raise ValueError(
@@ -2651,7 +3087,7 @@ class ColabManager:
             destination_root.mkdir(parents=True, exist_ok=True)
         transferred: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
-        remote_root = PurePosixPath(root["path"])
+        transfer_seconds = 0.0
         for item in files:
             relative = (
                 PurePosixPath(item["path"]).relative_to(remote_root)
@@ -2704,7 +3140,9 @@ class ColabManager:
                 wire_checksum = checksum
                 codec = "none"
                 if compression == "gzip" or (
-                    compression == "auto" and content_bytes >= compression_min_bytes
+                    compression == "auto"
+                    and content_bytes >= compression_min_bytes
+                    and _auto_compression_candidate(PurePosixPath(item["path"]))
                 ):
                     remote_compressed = "/content/.colab-mcp/transfers/" + uuid.uuid4().hex + ".gz"
                     candidate = await self._remote_operation(
@@ -2733,48 +3171,20 @@ class ColabManager:
                             lease_token=lease_token,
                         )
                         remote_compressed = None
-                offset = 0
-                content_written = 0
-                wire_digest = hashlib.sha256()
-                content_digest = hashlib.sha256()
-                decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if codec == "gzip" else None
-                with temporary.open("wb") as handle:
-                    while True:
-                        chunk = await self._remote_operation(
-                            "fs_read",
-                            {"path": wire_path, "offset": offset, "limit": chunk_size},
-                            session.name,
-                            lease_token=lease_token,
-                        )
-                        wire_data = base64.b64decode(chunk["data_base64"], validate=True)
-                        wire_digest.update(wire_data)
-                        content_data = (
-                            decompressor.decompress(wire_data) if decompressor else wire_data
-                        )
-                        content_written += len(content_data)
-                        if content_written > content_bytes or content_written > max_total_bytes:
-                            raise RuntimeError("Decompressed transfer exceeded declared size bound")
-                        content_digest.update(content_data)
-                        handle.write(content_data)
-                        offset = chunk["next_offset"]
-                        if time.monotonic() - last_heartbeat >= 15:
-                            await self._keepalive_once(session)
-                            last_heartbeat = time.monotonic()
-                        if chunk["eof"]:
-                            break
-                    if decompressor:
-                        final_data = decompressor.flush()
-                        content_written += len(final_data)
-                        if content_written > content_bytes or content_written > max_total_bytes:
-                            raise RuntimeError("Decompressed transfer exceeded declared size bound")
-                        content_digest.update(final_data)
-                        handle.write(final_data)
-                        if not decompressor.eof:
-                            raise RuntimeError("Compressed transfer ended before the gzip stream")
-                if offset != wire_bytes or wire_digest.hexdigest() != wire_checksum:
-                    raise RuntimeError(f"Wire checksum mismatch while downloading {item['path']}")
-                if content_written != content_bytes or content_digest.hexdigest() != checksum:
-                    raise RuntimeError(f"Checksum mismatch while downloading {item['path']}")
+                transfer_started = time.monotonic()
+                await self._raw_download_file(
+                    session,
+                    wire_path,
+                    temporary,
+                    codec,
+                    content_bytes,
+                    wire_bytes,
+                    wire_checksum,
+                    checksum,
+                    max_total_bytes,
+                    chunk_size,
+                )
+                transfer_seconds += time.monotonic() - transfer_started
                 temporary.replace(destination)
                 transferred.append(
                     {
@@ -2808,6 +3218,7 @@ class ColabManager:
             "lease": lease,
             "timings": {
                 "assignment_lookup_seconds": lease["assignment_lookup_seconds"],
+                "data_transfer_seconds": round(transfer_seconds, 3),
                 "total_seconds": round(time.monotonic() - operation_started, 3),
             },
         }
@@ -2986,14 +3397,6 @@ class ColabManager:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         nbformat.write(notebook, output_path)
         return {"output_path": str(output_path), "executed_cells": executed}
-
-    async def upload(self, local: str, remote: str, name: str | None) -> dict[str, Any]:
-        """Compatibility alias for the bounded, checksummed transfer path."""
-        return await self.transfer_upload(local, remote, name)
-
-    async def download(self, remote: str, local: str, name: str | None) -> dict[str, Any]:
-        """Compatibility alias for the bounded, checksummed transfer path."""
-        return await self.transfer_download(remote, local, name)
 
     async def stop(self, name: str | None) -> dict[str, Any]:
         session = self.resolve(name)

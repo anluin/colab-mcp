@@ -9,7 +9,12 @@
   "homepage": "https://github.com/anluin/colab-mcp",
   "repository": "https://github.com/anluin/colab-mcp",
   "license": "Apache-2.0",
-  "keywords": ["google-colab", "gpu", "mcp", "remote-compute"],
+  "keywords": [
+    "google-colab",
+    "gpu",
+    "mcp",
+    "remote-compute"
+  ],
   "skills": "./skills/",
   "mcpServers": "./.mcp.json",
   "interface": {
@@ -18,7 +23,10 @@
     "longDescription": "Run guarded jobs on ephemeral Colab runtimes, synchronize project folders, recover durable output, and clean up assignments.",
     "developerName": "anluin",
     "category": "Developer Tools",
-    "capabilities": ["Read", "Write"],
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
     "websiteURL": "https://github.com/anluin/colab-mcp",
     "defaultPrompt": [
       "Run this workload on Colab and return verified artifacts.",

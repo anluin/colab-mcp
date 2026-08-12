@@ -1,4 +1,4 @@
 interface:
   display_name: "Colab Workspace Sync"
-  short_description: "Synchronize project folders with Colab"
-  default_prompt: "Use $colab-workspace-sync to synchronize this project folder with Colab and preserve changed artifacts."
+  short_description: "Safely sync focused Colab staging folders"
+  default_prompt: "Use $colab-workspace-sync to create a purpose-specific temporary staging folder, dry-run its focused sync, and preserve verified artifacts."

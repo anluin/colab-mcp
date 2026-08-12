@@ -2,6 +2,7 @@ import asyncio
 import base64
 import gzip
 import hashlib
+import io
 import json
 import os
 import tarfile
@@ -35,6 +36,8 @@ from src.manager import (
     _extract_control_timing,
     _json_safe,
     _secure_permissions,
+    _sync_diff,
+    _sync_selected,
     require_local_file,
 )
 
@@ -61,9 +64,73 @@ def manager(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> ColabManager:
     async def quiet_heartbeat(_session, stop):
         await stop.wait()
 
+    async def binary_upload_file(source, remote_path, offset, runtime, lease_token, timeout=900):
+        started = time.monotonic()
+        with source.open("rb") as handle:
+            handle.seek(offset)
+            while chunk := handle.read(2_000_000):
+                result = await instance._remote_operation(
+                    "transfer_upload_chunk",
+                    {
+                        "path": remote_path,
+                        "offset": offset,
+                        "data_base64": base64.b64encode(chunk).decode(),
+                    },
+                    runtime.name,
+                    lease_token=lease_token,
+                )
+                offset = int(result["offset"])
+        return {
+            "offset": offset,
+            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "seconds": time.monotonic() - started,
+        }
+
+    async def raw_download_file(
+        runtime,
+        remote_path,
+        destination,
+        codec,
+        content_bytes,
+        wire_bytes,
+        wire_checksum,
+        content_checksum,
+        max_total_bytes,
+        chunk_size,
+    ):
+        offset = 0
+        wire_digest = hashlib.sha256()
+        content_digest = hashlib.sha256()
+        decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS) if codec == "gzip" else None
+        with destination.open("wb") as handle:
+            while True:
+                chunk = await instance._remote_operation(
+                    "fs_read",
+                    {"path": remote_path, "offset": offset, "limit": chunk_size},
+                    runtime.name,
+                    lease_token="b" * 32,
+                )
+                wire = base64.b64decode(chunk["data_base64"])
+                wire_digest.update(wire)
+                content = decompressor.decompress(wire) if decompressor else wire
+                content_digest.update(content)
+                handle.write(content)
+                offset = int(chunk["next_offset"])
+                if chunk["eof"]:
+                    break
+            if decompressor:
+                final = decompressor.flush()
+                content_digest.update(final)
+                handle.write(final)
+        assert offset == wire_bytes
+        assert wire_digest.hexdigest() == wire_checksum
+        assert content_digest.hexdigest() == content_checksum
+
     instance.allocation_probe = stable_probe
     instance._operation_lease = stable_operation_lease
     instance._critical_heartbeat = quiet_heartbeat
+    instance._binary_upload_file = binary_upload_file
+    instance._raw_download_file = raw_download_file
     return instance
 
 
@@ -104,6 +171,43 @@ def test_windows_permission_helper_is_a_safe_noop(tmp_path: Path):
 
 def test_json_safe_replaces_bytes():
     assert _json_safe({"data": b"abc"}) == {"data": "<3 bytes>"}
+
+
+def test_sync_selection_is_positive_and_keeps_safety_exclusions():
+    assert _sync_selected("src/train.py", ("src/**",)) == (True, None)
+    assert _sync_selected("README.md", ("src/**",)) == (False, "not_in_include")
+    accepted, reason = _sync_selected(".git/config", (".git/**",))
+    assert accepted is False
+    assert reason == "built_in:.git/**"
+    assert _sync_selected("__pycache__/module.pyc", ()) == (
+        False,
+        "built_in:**/__pycache__/**",
+    )
+
+
+def test_sync_diff_reports_reasons_and_destination_only_files():
+    source = [
+        {"path": "new.bin", "size": 4, "sha256": "a"},
+        {"path": "size.bin", "size": 5, "sha256": "b"},
+        {"path": "content.bin", "size": 6, "sha256": "c"},
+        {"path": "same.bin", "size": 7, "sha256": "d"},
+    ]
+    destination = [
+        {"path": "size.bin", "size": 4, "sha256": "b"},
+        {"path": "content.bin", "size": 6, "sha256": "x"},
+        {"path": "same.bin", "size": 7, "sha256": "d"},
+        {"path": "extra.bin", "size": 1, "sha256": "e"},
+    ]
+    result = _sync_diff(source, destination, 2)
+    assert result["files_to_transfer_count"] == 3
+    assert result["files_truncated"] == 1
+    assert [item["reason"] for item in result["files_to_transfer"]] == [
+        "destination_missing",
+        "size_changed",
+    ]
+    assert result["unchanged_count"] == 1
+    assert result["destination_only"] == ["extra.bin"]
+    assert result["transfer_bytes"] == 15
 
 
 def test_kernel_outputs_are_bounded_with_explicit_marker():
@@ -1242,7 +1346,9 @@ def test_connection_setup_has_hard_local_deadline(tmp_path: Path, monkeypatch: p
     assert caught.value.details["local_deadline_seconds"] == 6
 
 
-def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_upload_is_binary_streamed_verified_and_staged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
     instance = manager(tmp_path, monkeypatch)
     source = tmp_path / "source.bin"
     source.write_bytes(b"abcdefgh")
@@ -1286,12 +1392,12 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
         )
     )
     assert bytes(wire) == b"abcdefgh"
-    assert [item["bytes_sent"] for item in progress] == [3, 6, 8]
+    assert [item["bytes_sent"] for item in progress] == [8]
     assert moves[0]["destination"] == "/content/destination.bin"
     assert removes[0]["missing_ok"] is True
     assert result["files_transferred"][0]["sha256"] == expected_checksum
     assert result["lease"]["status"] == "stable"
-    assert result["progress_events_emitted"] == 3
+    assert result["progress_events_emitted"] == 1
     assert result["timings"]["total_seconds"] >= 0
 
 
@@ -1338,10 +1444,16 @@ def test_workspace_upload_batches_changed_files_into_one_verified_archive(
     instance._remote_stat_or_none = stat_or_none
     instance._remote_operation = remote
     result = asyncio.run(
-        instance.workspace_upload(str(source), "/content/project", "runtime", chunk_size=2_000_000)
+        instance.workspace_upload(
+            str(source),
+            "/content/project",
+            "runtime",
+            chunk_size=2_000_000,
+            selected_paths={"changed.py", "same.txt"},
+            changed_paths={"changed.py"},
+        )
     )
     assert operations == [
-        "workspace_manifest",
         "transfer_upload_chunk",
         "workspace_bundle_publish",
     ]
@@ -1349,6 +1461,107 @@ def test_workspace_upload_batches_changed_files_into_one_verified_archive(
     assert len(result["files_transferred"]) == 1
     assert len(result["files_skipped"]) == 1
     assert result["progress_events_emitted"] == 1
+
+
+def test_workspace_sync_plan_filters_before_diff_and_has_stable_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "source"
+    (source / "src").mkdir(parents=True)
+    (source / ".git").mkdir()
+    (source / "src" / "train.py").write_text("print('new')", encoding="utf-8")
+    (source / "README.md").write_text("ignored", encoding="utf-8")
+    (source / ".git" / "config").write_text("secret", encoding="utf-8")
+
+    async def remote(operation, payload, name, lease_token=None):
+        assert operation == "workspace_manifest"
+        return {
+            "files": [
+                {"path": "src/train.py", "size": 5, "sha256": "old"},
+                {"path": "remote-only.bin", "size": 1, "sha256": "x"},
+            ]
+        }
+
+    instance._remote_operation = remote
+    first, paths, changed, selected_name, lease = asyncio.run(
+        instance.workspace_sync_plan(
+            "push", str(source), "/content/workspace", "runtime", include=["src/**"]
+        )
+    )
+    second, *_ = asyncio.run(
+        instance.workspace_sync_plan(
+            "push", str(source), "/content/workspace", "runtime", include=["src/**"]
+        )
+    )
+
+    assert first["plan_id"] == second["plan_id"]
+    assert paths == ["src/train.py"]
+    assert changed == ["src/train.py"]
+    assert selected_name == "runtime"
+    assert lease["lease_token"] == "b" * 32
+    assert first["files_to_transfer"][0]["reason"] == "size_changed"
+    assert first["excluded_count"] == 2
+    assert first["destination_only"] == ["remote-only.bin"]
+    assert first["speed_estimate"]["status"] == "insufficient_history"
+
+
+def test_workspace_upload_auto_does_not_gzip_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "clip.mp4").write_bytes(b"already-compressed-media" * 100)
+    wire = bytearray()
+
+    async def stat_or_none(*_args, **_kwargs):
+        return None
+
+    async def remote(operation, payload, _name, **_kwargs):
+        if operation == "workspace_manifest":
+            return {"files": []}
+        if operation == "transfer_upload_chunk":
+            wire.extend(base64.b64decode(payload["data_base64"]))
+            return {"offset": len(wire), "already_applied": False}
+        if operation == "workspace_bundle_publish":
+            assert payload["compression"] == "none"
+            with tarfile.open(fileobj=io.BytesIO(wire)) as bundle:
+                manifest_file = bundle.extractfile("manifest.json")
+                assert manifest_file is not None
+                manifest = json.loads(manifest_file.read())
+            return {"files": manifest, "total_bytes": 2400}
+        raise AssertionError(operation)
+
+    instance._remote_stat_or_none = stat_or_none
+    instance._remote_operation = remote
+    result = asyncio.run(instance.workspace_upload(str(source), "/content/project", "runtime"))
+    assert result["compression"] == "none"
+
+
+def test_transfer_upload_auto_does_not_gzip_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "clip.mp4"
+    source.write_bytes(b"media" * 1000)
+    monkeypatch.setattr("src.manager._gzip_local_file", lambda _path: pytest.fail("gzip attempted"))
+
+    async def stat_or_none(*_args, **_kwargs):
+        return None
+
+    wire = bytearray()
+
+    async def remote(operation, payload, _name, **_kwargs):
+        if operation == "transfer_upload_chunk":
+            wire.extend(base64.b64decode(payload["data_base64"]))
+            return {"offset": len(wire), "already_applied": False}
+        if operation == "fs_stat":
+            return {"sha256": hashlib.sha256(wire).hexdigest()}
+        if operation in {"fs_move", "fs_remove"}:
+            return {}
+        raise AssertionError(operation)
+
+    instance._remote_stat_or_none = stat_or_none
+    instance._remote_operation = remote
+    result = asyncio.run(instance.transfer_upload(str(source), "/content/clip.mp4", "runtime"))
+    assert result["files_transferred"][0]["compression"] == "none"
 
 
 def test_workspace_upload_no_change_needs_only_manifest_round_trip(
@@ -1446,7 +1659,7 @@ def test_upload_resumes_verified_staging_on_same_incarnation(
         )
     )
     assert bytes(staged) == b"abcdefgh"
-    assert [event["bytes_sent"] for event in progress] == [6, 8]
+    assert [event["bytes_sent"] for event in progress] == [8]
     assert result["files_transferred"][0]["resumed_from_bytes"] == 3
 
 
@@ -1518,6 +1731,40 @@ def test_download_is_chunked_verified_and_atomic(tmp_path: Path, monkeypatch: py
     )
     assert destination.read_bytes() == content
     assert result["files_transferred"][0]["sha256"] == checksum
+
+
+def test_download_auto_does_not_gzip_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    instance = manager(tmp_path, monkeypatch)
+    content = b"video-payload" * 100
+    checksum = hashlib.sha256(content).hexdigest()
+
+    async def remote_files(*_args, **_kwargs):
+        root = {"kind": "file", "path": "/content/clip.mp4", "size": len(content)}
+        return root, [root]
+
+    async def remote(operation, payload, _name, **_kwargs):
+        assert operation != "fs_gzip_compress"
+        if operation == "fs_stat":
+            return {"sha256": checksum}
+        if operation == "fs_read":
+            offset = payload["offset"]
+            data = content[offset : offset + payload["limit"]]
+            next_offset = offset + len(data)
+            return {
+                "data_base64": base64.b64encode(data).decode(),
+                "next_offset": next_offset,
+                "eof": next_offset == len(content),
+            }
+        raise AssertionError(operation)
+
+    instance._remote_files = remote_files
+    instance._remote_operation = remote
+    destination = tmp_path / "clip.mp4"
+    result = asyncio.run(
+        instance.transfer_download("/content/clip.mp4", str(destination), "runtime")
+    )
+    assert destination.read_bytes() == content
+    assert result["files_transferred"][0]["compression"] == "none"
     assert not list(tmp_path.glob("*.colab-mcp-part-*"))
 
 
@@ -1647,34 +1894,6 @@ def test_remote_directory_walk_respects_listing_bound(
     assert root["kind"] == "directory"
     assert files == []
     assert seen_limits == [10_000]
-
-
-def test_legacy_transfer_aliases_use_bounded_verified_implementation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-):
-    instance = manager(tmp_path, monkeypatch)
-    calls = []
-
-    async def upload(local, remote, name):
-        calls.append(("upload", local, remote, name))
-        return {"files_transferred": []}
-
-    async def download(remote, local, name):
-        calls.append(("download", remote, local, name))
-        return {"files_transferred": []}
-
-    instance.transfer_upload = upload
-    instance.transfer_download = download
-    assert asyncio.run(instance.upload("local", "/content/remote", "runtime")) == {
-        "files_transferred": []
-    }
-    assert asyncio.run(instance.download("/content/remote", "local", "runtime")) == {
-        "files_transferred": []
-    }
-    assert calls == [
-        ("upload", "local", "/content/remote", "runtime"),
-        ("download", "/content/remote", "local", "runtime"),
-    ]
 
 
 def test_process_export_atomically_publishes_then_explicitly_releases(

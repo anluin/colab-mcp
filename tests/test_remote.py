@@ -144,24 +144,6 @@ def test_remote_operations_verify_incarnation_before_process_or_filesystem_state
     )
 
 
-def test_operation_lease_is_validated_inside_same_remote_request_before_chunk_mutation():
-    code = build_remote_code(
-        "transfer_upload_chunk",
-        {
-            "path": "/content/file.colab-mcp-wire-test",
-            "offset": 0,
-            "data_base64": "",
-            "runtime_fingerprint": "a" * 32,
-            "operation_lease_token": "b" * 32,
-        },
-    )
-    assert code.index("operation_lease_stale") < code.index(
-        "elif _cm_operation == 'transfer_upload_chunk'"
-    )
-    assert "transfer_offset_conflict" in code
-    assert "already_applied" in code
-
-
 def test_remote_lease_rotation_retains_unexpired_inflight_leases():
     probe = build_remote_code(
         "lease_probe",

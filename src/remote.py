@@ -326,14 +326,36 @@ try:
         _cm_workspace = _cm_path(_cm_payload['path'])
         _cm_max_files = int(_cm_payload['max_files'])
         _cm_max_total = int(_cm_payload['max_total_bytes'])
+        _cm_include = tuple(_cm_payload.get('include', []))
+        _cm_exclude = tuple(_cm_payload.get('exclude', []))
+        def _cm_matches(_cm_relative, _cm_pattern):
+            _cm_pattern = _cm_pattern.strip().replace('\\\\', '/').lstrip('/')
+            if _cm_pattern.startswith('**/') and _cm_pattern.endswith('/**'):
+                _cm_directory = _cm_pattern[3:-3].strip('/')
+                return _cm_relative == _cm_directory or _cm_relative.startswith(_cm_directory + '/') or f'/{{_cm_directory}}/' in f'/{{_cm_relative}}/'
+            if _cm_pattern.endswith('/**'):
+                _cm_prefix = _cm_pattern[:-3].rstrip('/')
+                return _cm_relative == _cm_prefix or _cm_relative.startswith(_cm_prefix + '/')
+            _cm_candidate = _cm_pathlib.PurePosixPath(_cm_relative)
+            return _cm_candidate.match(_cm_pattern) or ('/' not in _cm_pattern and _cm_candidate.name == _cm_pattern)
         if not _cm_workspace.exists():
-            _cm_result = {{'path': str(_cm_workspace), 'files': [], 'total_bytes': 0}}
+            _cm_result = {{'path': str(_cm_workspace), 'files': [], 'total_bytes': 0, 'excluded': []}}
         elif not _cm_workspace.is_dir():
             raise NotADirectoryError(str(_cm_workspace))
         else:
-            _cm_workspace_files = sorted(
-                item for item in _cm_workspace.rglob('*')
-                if item.is_file() and not item.is_symlink())
+            _cm_workspace_files = []
+            _cm_workspace_excluded = []
+            for _cm_item in sorted(_cm_workspace.rglob('*')):
+                if not _cm_item.is_file() or _cm_item.is_symlink():
+                    continue
+                _cm_relative = _cm_item.relative_to(_cm_workspace).as_posix()
+                _cm_reason = next((f'built_in:{{p}}' for p in _cm_exclude if _cm_matches(_cm_relative, p)), None)
+                if _cm_reason is None and _cm_include and not any(_cm_matches(_cm_relative, p) for p in _cm_include):
+                    _cm_reason = 'not_in_include'
+                if _cm_reason is not None:
+                    _cm_workspace_excluded.append({{'path': _cm_relative, 'reason': _cm_reason}})
+                else:
+                    _cm_workspace_files.append(_cm_item)
             if len(_cm_workspace_files) > _cm_max_files:
                 raise ValueError('workspace exceeds max_files')
             _cm_workspace_total = sum(item.stat().st_size for item in _cm_workspace_files)
@@ -352,7 +374,7 @@ try:
                 }})
             _cm_result = {{
                 'path': str(_cm_workspace), 'files': _cm_workspace_manifest,
-                'total_bytes': _cm_workspace_total,
+                'total_bytes': _cm_workspace_total, 'excluded': _cm_workspace_excluded,
             }}
     elif _cm_operation == 'workspace_bundle_publish':
         _cm_archive = _cm_path(_cm_payload['archive_path'])
@@ -460,40 +482,6 @@ try:
             _cm_shutil.rmtree(_cm_publish_root, ignore_errors=True)
             if _cm_publish_success:
                 _cm_archive.unlink(missing_ok=True)
-    elif _cm_operation == 'transfer_upload_chunk':
-        _cm_target = _cm_path(_cm_payload['path'])
-        _cm_offset = int(_cm_payload['offset'])
-        _cm_data = _cm_base64.b64decode(_cm_payload['data_base64'], validate=True)
-        if _cm_offset < 0 or len(_cm_data) > 2000000:
-            raise ValueError('invalid transfer chunk bounds')
-        _cm_target.parent.mkdir(parents=True, exist_ok=True)
-        _cm_current_size = _cm_target.stat().st_size if _cm_target.is_file() else 0
-        _cm_chunk_digest = _cm_hashlib.sha256(_cm_data).hexdigest()
-        if _cm_current_size == _cm_offset + len(_cm_data):
-            with _cm_target.open('rb') as _cm_handle:
-                _cm_handle.seek(_cm_offset)
-                _cm_existing = _cm_handle.read(len(_cm_data))
-            if _cm_hashlib.sha256(_cm_existing).hexdigest() != _cm_chunk_digest:
-                raise RuntimeError('transfer_resume_conflict: staged chunk differs')
-            _cm_result = {{
-                'path': str(_cm_target), 'offset': _cm_current_size,
-                'chunk_bytes': len(_cm_data), 'chunk_sha256': _cm_chunk_digest,
-                'already_applied': True,
-            }}
-        elif _cm_current_size != _cm_offset:
-            raise RuntimeError(
-                'transfer_offset_conflict: expected ' + str(_cm_offset)
-                + ', staged file has ' + str(_cm_current_size) + ' bytes')
-        else:
-            with _cm_target.open('ab') as _cm_handle:
-                _cm_handle.write(_cm_data)
-                _cm_handle.flush()
-                _cm_os.fsync(_cm_handle.fileno())
-            _cm_result = {{
-                'path': str(_cm_target), 'offset': _cm_offset + len(_cm_data),
-                'chunk_bytes': len(_cm_data), 'chunk_sha256': _cm_chunk_digest,
-                'already_applied': False,
-            }}
     elif _cm_operation == 'process_start':
         _cm_cwd = _cm_path(_cm_payload.get('cwd'))
         if not _cm_cwd.is_dir():

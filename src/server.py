@@ -9,7 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .logging_config import configure_logging
-from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager
+from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager, TransferError
 from .version import COLAB_CLI_VERSION, COLAB_MCP_VERSION
 
 manager = ColabManager()
@@ -487,54 +487,6 @@ async def colab_fs_remove(
     return await manager.filesystem_remove(path, session, recursive, missing_ok)
 
 
-async def colab_transfer_upload(
-    local_path: LocalPath,
-    remote_path: RemotePath,
-    ctx: Context,
-    session: SessionSelector = None,
-    overwrite: Overwrite = False,
-    sync: Annotated[
-        bool, Field(description="True skips destinations with the same SHA-256; defaults to true.")
-    ] = True,
-    chunk_size: ChunkSize = 524_288,
-    max_total_bytes: MaxTotalBytes = 100_000_000,
-    max_files: MaxFiles = 10_000,
-    compression: CompressionMode = "auto",
-    compression_min_bytes: CompressionMinBytes = 1_048_576,
-    compression_min_savings: CompressionMinSavings = 0.10,
-    lease_token: LeaseToken = None,
-    transfer_id: Annotated[
-        str | None,
-        Field(
-            description="Opaque 32-character transfer ID from a failed upload. Reuse it to resume on the same incarnation; null starts a new transfer."
-        ),
-    ] = None,
-) -> dict:
-    """Upload atomically with progress. On failure retain transfer_id/staging_path and resume only on the same fingerprint; otherwise clean staging."""
-
-    async def progress(event: dict) -> None:
-        await ctx.report_progress(
-            event["bytes_sent"], event["total_bytes"], json.dumps(event, separators=(",", ":"))
-        )
-
-    return await manager.transfer_upload(
-        local_path=local_path,
-        remote_path=remote_path,
-        name=session,
-        overwrite=overwrite,
-        sync=sync,
-        chunk_size=chunk_size,
-        max_total_bytes=max_total_bytes,
-        max_files=max_files,
-        compression=compression,
-        compression_min_bytes=compression_min_bytes,
-        compression_min_savings=compression_min_savings,
-        lease_token=lease_token,
-        transfer_id=transfer_id,
-        progress=progress,
-    )
-
-
 @mcp.tool()
 async def colab_transfer_cleanup(
     staging_paths: Annotated[
@@ -566,39 +518,6 @@ async def colab_allocation_probe(
     return await manager.allocation_probe(session, observations, interval)
 
 
-async def colab_transfer_download(
-    remote_path: RemotePath,
-    local_path: LocalPath,
-    session: SessionSelector = None,
-    overwrite: Overwrite = False,
-    sync: Annotated[
-        bool, Field(description="True skips local files with the same SHA-256; defaults to true.")
-    ] = True,
-    chunk_size: ChunkSize = 524_288,
-    max_total_bytes: MaxTotalBytes = 100_000_000,
-    max_files: MaxFiles = 10_000,
-    compression: CompressionMode = "auto",
-    compression_min_bytes: CompressionMinBytes = 1_048_576,
-    compression_min_savings: CompressionMinSavings = 0.10,
-    lease_token: LeaseToken = None,
-) -> dict:
-    """Download atomically. Pre-submission connection failures retry once with the same still-valid lease/fingerprint; other interruptions require sync=true retry and hash verification."""
-    return await manager.transfer_download(
-        remote_path,
-        local_path,
-        session,
-        overwrite,
-        sync,
-        chunk_size,
-        max_total_bytes,
-        max_files,
-        compression,
-        compression_min_bytes,
-        compression_min_savings,
-        lease_token,
-    )
-
-
 @mcp.tool()
 async def colab_execute_notebook(
     source: Annotated[str, Field(description="Existing local .ipynb input path.")],
@@ -610,20 +529,6 @@ async def colab_execute_notebook(
 ) -> dict:
     """Execute notebook cells. On failure keep the input/output checkpoint; reacquire and rerun deliberately."""
     return await manager.execute_notebook(source, output, session, cell_timeout)
-
-
-async def colab_upload(
-    local_path: LocalPath, remote_path: RemotePath, session: SessionSelector = None
-) -> dict:
-    """Compatibility alias for bounded, checksummed colab_transfer_upload."""
-    return await manager.upload(local_path, remote_path, session)
-
-
-async def colab_download(
-    remote_path: RemotePath, local_path: LocalPath, session: SessionSelector = None
-) -> dict:
-    """Compatibility alias for bounded, checksummed colab_transfer_download."""
-    return await manager.download(remote_path, local_path, session)
 
 
 @mcp.tool()
@@ -687,13 +592,67 @@ async def colab_workspace_sync(
     max_total_bytes: MaxTotalBytes = 1_000_000_000,
     max_files: MaxFiles = 10_000,
     compression: CompressionMode = "auto",
+    include: Annotated[
+        list[str] | None,
+        Field(
+            description="Optional positive POSIX-glob selection relative to the chosen roots; built-in safety exclusions still apply.",
+            max_length=100,
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool,
+        Field(
+            description="Plan and report differences without staging, transferring, or publishing files."
+        ),
+    ] = False,
+    expected_plan_id: Annotated[
+        str | None,
+        Field(description="Execute only if a fresh plan still has this dry-run plan_id."),
+    ] = None,
+    preview_limit: Annotated[
+        int,
+        Field(ge=1, le=1000, description="Maximum changed/excluded paths returned per category."),
+    ] = 200,
 ) -> dict:
-    """Incrementally synchronize a folder tree using SHA-256, bounded chunks, compression, and atomic per-file publication. Unchanged files are skipped; extra destination files are never deleted. Retry with the same lease after confirmed pre-submission failure."""
+    """Plan or incrementally sync one purposeful folder using SHA-256 and atomic publication. Use include for a positive selection and dry_run before large transfers. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
     local = Path(local_folder).expanduser().resolve()
     if direction == "push" and not local.is_dir():
         raise ValueError("local_folder must be an existing directory for push")
     if lease_token is None:
         lease_token = (await manager.allocation_probe(session))["lease_token"]
+    (
+        plan,
+        selected_paths,
+        changed_paths,
+        selected_name,
+        accepted_lease,
+    ) = await manager.workspace_sync_plan(
+        direction=direction,
+        local_folder=str(local),
+        remote_folder=remote_folder,
+        name=session,
+        include=include,
+        max_files=max_files,
+        max_total_bytes=max_total_bytes,
+        lease_token=lease_token,
+        preview_limit=preview_limit,
+    )
+    lease_token = accepted_lease["lease_token"]
+    if expected_plan_id is not None and expected_plan_id != plan["plan_id"]:
+        raise TransferError(
+            "sync_plan_changed",
+            "The workspace changed after planning; inspect a fresh dry run before syncing.",
+            {"expected_plan_id": expected_plan_id, "actual_plan_id": plan["plan_id"]},
+        )
+    if dry_run:
+        return {
+            "direction": direction,
+            "mode": "content_hash_incremental",
+            "dry_run": True,
+            "deletes_destination_extras": False,
+            "lease": accepted_lease,
+            "plan": plan,
+        }
     if direction == "push":
 
         async def progress(event: dict) -> None:
@@ -706,7 +665,7 @@ async def colab_workspace_sync(
         result = await manager.workspace_upload(
             local_folder=str(local),
             remote_folder=remote_folder,
-            name=session,
+            name=selected_name,
             chunk_size=chunk_size,
             max_total_bytes=max_total_bytes,
             max_files=max_files,
@@ -714,14 +673,14 @@ async def colab_workspace_sync(
             compression_min_savings=0.10,
             lease_token=lease_token,
             progress=progress,
+            selected_paths=set(selected_paths),
+            changed_paths=set(changed_paths),
         )
     else:
-        selected, accepted = await manager._operation_lease(session, lease_token)
-        lease_token = accepted["lease_token"]
         remote = await manager._remote_operation(
             "fs_stat",
             {"path": remote_folder, "checksum": False},
-            selected.name,
+            selected_name,
             lease_token=lease_token,
         )
         if remote.get("kind") != "directory":
@@ -729,7 +688,7 @@ async def colab_workspace_sync(
         result = await manager.transfer_download(
             remote_path=remote_folder,
             local_path=str(local),
-            name=selected.name,
+            name=selected_name,
             overwrite=True,
             sync=True,
             chunk_size=chunk_size,
@@ -739,11 +698,16 @@ async def colab_workspace_sync(
             compression_min_bytes=1_048_576,
             compression_min_savings=0.10,
             lease_token=lease_token,
+            selected_paths=set(selected_paths),
         )
+    transfer_seconds = float(result.get("timings", {}).get("data_transfer_seconds", 0))
+    manager._record_sync_speed(direction, int(result.get("wire_bytes", 0)), transfer_seconds)
     return {
         "direction": direction,
         "mode": "content_hash_incremental",
+        "dry_run": False,
         "deletes_destination_extras": False,
+        "plan": plan,
         **result,
     }
 
