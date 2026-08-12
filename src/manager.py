@@ -2956,7 +2956,12 @@ class ColabManager:
         return {"removed": removed, "already_missing": missing, "lease": lease}
 
     async def _remote_files(
-        self, path: str, name: str | None, max_files: int, lease_token: str | None = None
+        self,
+        path: str,
+        name: str | None,
+        max_files: int,
+        lease_token: str | None = None,
+        selected_paths: set[str] | None = None,
     ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         if lease_token:
             root = await self._remote_operation(
@@ -2966,6 +2971,31 @@ class ColabManager:
             root = await self.filesystem_stat(path, name)
         if root["kind"] == "file":
             return root, [root]
+        if selected_paths is not None:
+            if len(selected_paths) > max_files:
+                raise ValueError(
+                    f"Remote transfer exceeds max_files={max_files}"
+                )
+            remote_root = PurePosixPath(root["path"])
+            selected_files = []
+            for selected in sorted(selected_paths):
+                relative = PurePosixPath(selected)
+                if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+                    raise ValueError(f"Invalid selected remote path: {selected!r}")
+                target = (remote_root / relative).as_posix()
+                if lease_token:
+                    item = await self._remote_operation(
+                        "fs_stat",
+                        {"path": target, "checksum": False},
+                        name,
+                        lease_token=lease_token,
+                    )
+                else:
+                    item = await self.filesystem_stat(target, name)
+                if item["kind"] != "file":
+                    raise ValueError(f"Selected remote path is not a file: {selected}")
+                selected_files.append(item)
+            return root, selected_files
         pending = [root["path"]]
         files: list[dict[str, Any]] = []
         while pending:
@@ -3017,7 +3047,11 @@ class ColabManager:
         session, lease = await self._operation_lease(name, lease_token)
         lease_token = lease["lease_token"]
         root, files = await self._remote_files(
-            remote_path, session.name, max_files, lease_token=lease_token
+            remote_path,
+            session.name,
+            max_files,
+            lease_token=lease_token,
+            selected_paths=selected_paths,
         )
         remote_root = PurePosixPath(root["path"])
         if selected_paths is not None:

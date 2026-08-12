@@ -1954,6 +1954,52 @@ def test_remote_directory_walk_respects_listing_bound(
     assert seen_limits == [10_000]
 
 
+def test_remote_positive_selection_does_not_walk_destination_extras(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    seen = []
+
+    async def stat(path, _name):
+        seen.append(path)
+        if path == "/content/root":
+            return {"path": path, "kind": "directory", "size": 0}
+        return {"path": path, "kind": "file", "size": 4}
+
+    async def listing(*_args, **_kwargs):
+        raise AssertionError("positive selection must not enumerate unrelated files")
+
+    instance.filesystem_stat = stat
+    instance.filesystem_list = listing
+    root, files = asyncio.run(
+        instance._remote_files(
+            "/content/root", None, 1, selected_paths={"nested/wanted.json"}
+        )
+    )
+    assert root["kind"] == "directory"
+    assert files == [
+        {"path": "/content/root/nested/wanted.json", "kind": "file", "size": 4}
+    ]
+    assert seen == ["/content/root", "/content/root/nested/wanted.json"]
+
+
+def test_remote_positive_selection_rejects_parent_traversal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+
+    async def stat(path, _name):
+        return {"path": path, "kind": "directory", "size": 0}
+
+    instance.filesystem_stat = stat
+    with pytest.raises(ValueError, match="Invalid selected remote path"):
+        asyncio.run(
+            instance._remote_files(
+                "/content/root", None, 1, selected_paths={"../escape.json"}
+            )
+        )
+
+
 def test_process_export_atomically_publishes_then_explicitly_releases(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
