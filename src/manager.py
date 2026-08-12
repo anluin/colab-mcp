@@ -50,7 +50,6 @@ from .remote import (
 )
 
 GPU_TYPES = {"T4", "L4", "G4", "H100", "A100"}
-COMPUTE_UNITS_URL = "https://colab.research.google.com/signup"
 MAX_TRANSFER_CHUNK = 2_000_000
 ALREADY_COMPRESSED_SUFFIXES = frozenset(
     {

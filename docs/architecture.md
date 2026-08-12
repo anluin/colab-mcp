@@ -112,7 +112,7 @@ release an assignment or infer artifacts from workload type.
 ## Upstream constraints
 
 Personal Colab has no supported VM suspend/snapshot operation, guaranteed accelerator inventory,
-or compute-unit balance API. The server does not scrape the browser-only balance endpoint; it links
-to Colab's account-management page instead. Reconnect is possible while an assignment endpoint and
+or compute-unit balance API. The server does not scrape the browser-only balance endpoint.
+Reconnect is possible while an assignment endpoint and
 kernel remain live; after Colab reclaims it, only persisted local metadata remains. The server
 reports these conditions rather than emulating unsupported behavior.

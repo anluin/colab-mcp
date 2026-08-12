@@ -9,7 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .logging_config import configure_logging
-from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager
+from .manager import AutoExportRule, ColabManager
 from .version import COLAB_CLI_VERSION, COLAB_MCP_VERSION
 
 manager = ColabManager()
@@ -676,20 +676,6 @@ async def colab_workspace_sync(
         "mode": "content_hash_incremental",
         "deletes_destination_extras": False,
         **result,
-    }
-
-
-@mcp.tool()
-def colab_compute_units() -> dict:
-    """Explain compute-unit visibility and return Google's official account-management URL."""
-    return {
-        "available_via_supported_api": False,
-        "balance": None,
-        "management_url": COMPUTE_UNITS_URL,
-        "reason": (
-            "Google Colab does not publish a supported API for a personal account's "
-            "compute-unit balance. The official CLI only opens this management page."
-        ),
     }
 
 

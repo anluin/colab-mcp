@@ -21,7 +21,6 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                 tools = await client.list_tools()
                 names = {tool.name for tool in tools.tools}
                 health = await client.call_tool("colab_health", {})
-                compute_units = await client.call_tool("colab_compute_units", {})
                 assert initialized.serverInfo.name == "Google Colab Runtime"
                 assert names == {
                     "colab_connector",
@@ -49,10 +48,8 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_resume_notebook",
                     "colab_paused_notebooks",
                     "colab_workspace_sync",
-                    "colab_compute_units",
                 }
                 assert not health.isError
-                assert not compute_units.isError
                 assert {
                     "colab_fs_read",
                     "colab_fs_write",

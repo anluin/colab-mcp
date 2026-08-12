@@ -114,7 +114,7 @@ Tools: `colab_health`, `colab_create_notebook`, `colab_start`, `colab_sessions`,
 `colab_process_output`, `colab_process_signal`, `colab_process_export`, `colab_execute`,
 `colab_execute_notebook`, `colab_allocation_probe`, `colab_workspace_sync`,
 `colab_transfer_cleanup`, `colab_pause_notebook`, `colab_resume_notebook`,
-`colab_paused_notebooks`, `colab_reconcile`, `colab_stop`, and `colab_compute_units`.
+`colab_paused_notebooks`, `colab_reconcile`, and `colab_stop`.
 Use `colab_inspect` after allocation to discover the actual runtime rather than assuming that a
 requested accelerator, executable, or CUDA version is present.
 
@@ -318,12 +318,6 @@ idempotent when a tracked runtime has already disappeared.
 Colab does not expose a supported suspended-VM or runtime-snapshot operation. Pause records the local notebook checkpoint and accelerator preference, then releases the runtime. Resume allocates a new runtime and can rerun the notebook.
 
 RAM variables, ad-hoc package installs, and files left only in `/content` do not survive. Put installation commands in the notebook and download checkpoints before pausing.
-
-## Compute units
-
-Google does not publish a supported API for reading the compute-unit balance of a personal Colab
-account. `colab_compute_units` returns this limitation and Google's official account-management URL.
-The server does not scrape undocumented browser endpoints.
 
 ## Agent workflows and self-repair
 
