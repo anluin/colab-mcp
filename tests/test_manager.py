@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import os
+import tarfile
 import time
 import zlib
 from pathlib import Path
@@ -1279,6 +1280,84 @@ def test_upload_is_chunked_verified_and_staged(tmp_path: Path, monkeypatch: pyte
     assert result["lease"]["status"] == "stable"
     assert result["progress_events_emitted"] == 3
     assert result["timings"]["total_seconds"] >= 0
+
+
+def test_workspace_upload_batches_changed_files_into_one_verified_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "project"
+    source.mkdir()
+    (source / "changed.py").write_text("print('new')\n", encoding="utf-8")
+    (source / "same.txt").write_text("same\n", encoding="utf-8")
+    same_hash = hashlib.sha256((source / "same.txt").read_bytes()).hexdigest()
+    wire = bytearray()
+    operations = []
+
+    async def stat_or_none(*_args, **_kwargs):
+        return None
+
+    async def remote(operation, payload, _name, **_kwargs):
+        operations.append(operation)
+        if operation == "workspace_manifest":
+            return {"files": [{"path": "same.txt", "size": 5, "sha256": same_hash}]}
+        if operation == "transfer_upload_chunk":
+            assert payload["offset"] == len(wire)
+            wire.extend(base64.b64decode(payload["data_base64"]))
+            return {"offset": len(wire), "already_applied": False}
+        if operation == "workspace_bundle_publish":
+            archive = tmp_path / (
+                "bundle.tar.gz" if payload["compression"] == "gzip" else "bundle.tar"
+            )
+            archive.write_bytes(wire)
+            with tarfile.open(
+                archive, "r:gz" if payload["compression"] == "gzip" else "r:"
+            ) as bundle:
+                manifest = json.loads(bundle.extractfile("manifest.json").read())
+                assert [item["path"] for item in manifest] == ["changed.py"]
+                assert (
+                    bundle.extractfile("files/changed.py").read()
+                    == (source / "changed.py").read_bytes()
+                )
+            return {"files": manifest, "total_bytes": manifest[0]["size"]}
+        raise AssertionError(operation)
+
+    instance._remote_stat_or_none = stat_or_none
+    instance._remote_operation = remote
+    result = asyncio.run(
+        instance.workspace_upload(str(source), "/content/project", "runtime", chunk_size=2_000_000)
+    )
+    assert operations == [
+        "workspace_manifest",
+        "transfer_upload_chunk",
+        "workspace_bundle_publish",
+    ]
+    assert result["strategy"] == "verified_bundle_delta"
+    assert len(result["files_transferred"]) == 1
+    assert len(result["files_skipped"]) == 1
+    assert result["progress_events_emitted"] == 1
+
+
+def test_workspace_upload_no_change_needs_only_manifest_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    instance = manager(tmp_path, monkeypatch)
+    source = tmp_path / "project"
+    source.mkdir()
+    file = source / "same.txt"
+    file.write_text("same\n", encoding="utf-8")
+    checksum = hashlib.sha256(file.read_bytes()).hexdigest()
+    operations = []
+
+    async def remote(operation, *_args, **_kwargs):
+        operations.append(operation)
+        return {"files": [{"path": "same.txt", "size": 5, "sha256": checksum}]}
+
+    instance._remote_operation = remote
+    result = asyncio.run(instance.workspace_upload(str(source), "/content/project", "runtime"))
+    assert operations == ["workspace_manifest"]
+    assert result["files_transferred"] == []
+    assert result["wire_bytes"] == 0
 
 
 def test_upload_interruption_preserves_remote_partial_for_resume(

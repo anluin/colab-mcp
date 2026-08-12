@@ -703,20 +703,16 @@ async def colab_workspace_sync(
                 json.dumps(event, separators=(",", ":")),
             )
 
-        result = await manager.transfer_upload(
-            local_path=str(local),
-            remote_path=remote_folder,
+        result = await manager.workspace_upload(
+            local_folder=str(local),
+            remote_folder=remote_folder,
             name=session,
-            overwrite=True,
-            sync=True,
             chunk_size=chunk_size,
             max_total_bytes=max_total_bytes,
             max_files=max_files,
             compression=compression,
-            compression_min_bytes=1_048_576,
             compression_min_savings=0.10,
             lease_token=lease_token,
-            transfer_id=None,
             progress=progress,
         )
     else:

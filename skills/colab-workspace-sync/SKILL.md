@@ -7,11 +7,16 @@ description: Synchronize whole local project or artifact directories with a Cola
 
 Use only `colab_workspace_sync` for ordinary file movement. Do not read, write, or shuttle individual files through MCP.
 
-- Use a dedicated remote root such as `/content/workspace`.
-- Push the local project directory before execution.
-- Pull a dedicated remote artifacts directory before release.
+- Create a temporary local sync root for each run. Populate it with the complete workload snapshot,
+  not the whole development checkout: include required tracked source, configuration, and inputs;
+  omit `.git`, caches, environments, old artifacts, and unrelated checkpoints.
+- Use task-specific remote roots such as `/content/workspaces/<task>/source` and
+  `/content/workspaces/<task>/artifacts`. Never mix source and generated artifacts.
+- Push the temporary source root before execution. Pull only the dedicated artifact root afterward.
+- Remove temporary local staging only after inputs are published or outputs are verified locally.
 - Reuse the operation lease while its fingerprint remains unchanged.
-- Let SHA-256 synchronization skip unchanged files and atomically replace changed files.
+- Let the verified bundle delta path batch changed source files, skip identical SHA-256 content,
+  and atomically replace each published file.
 - Expect compression to help text/source but not already-compressed checkpoints.
 - Do not expect deletion: destination-only files are deliberately preserved.
 
