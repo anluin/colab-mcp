@@ -9,7 +9,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from pydantic import Field
 
 from .logging_config import configure_logging
-from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager, TransferError
+from .manager import COMPUTE_UNITS_URL, AutoExportRule, ColabManager
 from .version import COLAB_CLI_VERSION, COLAB_MCP_VERSION
 
 manager = ColabManager()
@@ -599,34 +599,19 @@ async def colab_workspace_sync(
             max_length=100,
         ),
     ] = None,
-    dry_run: Annotated[
-        bool,
-        Field(
-            description="Plan and report differences without staging, transferring, or publishing files."
-        ),
-    ] = False,
-    expected_plan_id: Annotated[
-        str | None,
-        Field(description="Execute only if a fresh plan still has this dry-run plan_id."),
-    ] = None,
-    preview_limit: Annotated[
-        int,
-        Field(ge=1, le=1000, description="Maximum changed/excluded paths returned per category."),
-    ] = 200,
 ) -> dict:
-    """Plan or incrementally sync one purposeful folder using SHA-256 and atomic publication. Use include for a positive selection and dry_run before large transfers. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
+    """Incrementally sync one purposeful folder using SHA-256 and atomic publication. Use include for a positive selection. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
     local = Path(local_folder).expanduser().resolve()
     if direction == "push" and not local.is_dir():
         raise ValueError("local_folder must be an existing directory for push")
     if lease_token is None:
         lease_token = (await manager.allocation_probe(session))["lease_token"]
     (
-        plan,
         selected_paths,
         changed_paths,
         selected_name,
         accepted_lease,
-    ) = await manager.workspace_sync_plan(
+    ) = await manager.workspace_sync_selection(
         direction=direction,
         local_folder=str(local),
         remote_folder=remote_folder,
@@ -635,24 +620,8 @@ async def colab_workspace_sync(
         max_files=max_files,
         max_total_bytes=max_total_bytes,
         lease_token=lease_token,
-        preview_limit=preview_limit,
     )
     lease_token = accepted_lease["lease_token"]
-    if expected_plan_id is not None and expected_plan_id != plan["plan_id"]:
-        raise TransferError(
-            "sync_plan_changed",
-            "The workspace changed after planning; inspect a fresh dry run before syncing.",
-            {"expected_plan_id": expected_plan_id, "actual_plan_id": plan["plan_id"]},
-        )
-    if dry_run:
-        return {
-            "direction": direction,
-            "mode": "content_hash_incremental",
-            "dry_run": True,
-            "deletes_destination_extras": False,
-            "lease": accepted_lease,
-            "plan": plan,
-        }
     if direction == "push":
 
         async def progress(event: dict) -> None:
@@ -705,9 +674,7 @@ async def colab_workspace_sync(
     return {
         "direction": direction,
         "mode": "content_hash_incremental",
-        "dry_run": False,
         "deletes_destination_extras": False,
-        "plan": plan,
         **result,
     }
 

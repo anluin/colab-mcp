@@ -45,6 +45,15 @@ def test_stdio_mcp_initialize_list_and_safe_calls(tmp_path):
                     "colab_transfer_upload",
                     "colab_transfer_download",
                 }.isdisjoint(names)
+                workspace_tool = next(
+                    tool for tool in tools.tools if tool.name == "colab_workspace_sync"
+                )
+                workspace_properties = workspace_tool.inputSchema["properties"]
+                assert {
+                    "dry_run",
+                    "expected_plan_id",
+                    "preview_limit",
+                }.isdisjoint(workspace_properties)
 
                 status = await client.call_tool("colab_connector", {"action": "status"})
                 assert not status.isError

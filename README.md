@@ -256,11 +256,8 @@ Jupyter's authenticated raw-files endpoint. Kernel execution is used only to est
 receiver and publish verified staging, not to carry file bytes.
 
 An optional positive `include` list selects relative POSIX-glob paths after mandatory exclusions
-for VCS data, environments, caches, and common secret-key files. `dry_run=true` returns an immutable
-`plan_id`, bounded changed/excluded/destination-only previews, reason codes, byte totals, and an
-estimated MiB/s range derived only from observed transfers. Until history exists, it reports
-`insufficient_history` instead of inventing a speed. Execute with that ID as `expected_plan_id`;
-the server rejects drift with `sync_plan_changed`. Dry runs never stage, transfer, or publish files.
+for VCS data, environments, caches, and common secret-key files. Each sync computes the verified
+content-hash delta internally and transfers only changed files in a single call.
 
 `colab_allocation_probe` returns an opaque, one-hour `lease_token` bound to the tracked endpoint and
 runtime fingerprint both locally and inside that runtime. Pass it to a transfer or process start to
@@ -308,7 +305,7 @@ idempotent when a tracked runtime has already disappeared.
 3. Build a temporary local source snapshot containing only required tracked source, configuration,
    and private inputs; fetch public datasets and model weights directly on Colab. Never sync the
    repository root, VCS metadata, caches, environments, or historical outputs.
-4. Dry-run uncertain or large changes, then sync with its `expected_plan_id`. Push to
+4. Sync the focused source snapshot in one call. Push to
    `/content/workspaces/<task>/source` and write results only under the sibling
    `/content/workspaces/<task>/artifacts` directory.
 5. Create or execute a notebook or durable process.

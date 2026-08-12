@@ -16,15 +16,13 @@ Use only `colab_workspace_sync` for ordinary file movement. Do not read, write, 
   `/content/workspaces/<task>/artifacts`. Never mix source and generated artifacts.
 - Use `include` as a positive selection when a staging root still contains optional files. Built-in
   secret, VCS, cache, and environment exclusions cannot be overridden.
-- Run `dry_run=true` before a large or uncertain transfer. Inspect changed-file reasons, selected
-  and excluded counts, bytes, and MiB/s estimate. If acceptable, execute with the returned
-  `plan_id` as `expected_plan_id`; re-plan if `sync_plan_changed` is returned.
+- Sync in one call; the tool computes the verified content-hash delta internally and transfers only
+  changed files.
 - Push the temporary source root before execution. Pull only the dedicated artifact root afterward.
 - Remove temporary local staging only after inputs are published or outputs are verified locally.
 - Reuse the operation lease while its fingerprint remains unchanged.
 - Let the verified bundle delta path batch changed source files, skip identical SHA-256 content,
   and atomically replace each published file.
-- Treat `insufficient_history` as no speed estimate; never present it as measured throughput.
 - Expect compression to help text/source but not already-compressed checkpoints.
 - Do not expect deletion: destination-only files are deliberately preserved.
 

@@ -37,7 +37,6 @@ from src.manager import (
     _extract_control_timing,
     _json_safe,
     _secure_permissions,
-    _sync_diff,
     _sync_selected,
     require_local_file,
 )
@@ -257,31 +256,6 @@ def test_sync_selection_is_positive_and_keeps_safety_exclusions():
         False,
         "built_in:**/__pycache__/**",
     )
-
-
-def test_sync_diff_reports_reasons_and_destination_only_files():
-    source = [
-        {"path": "new.bin", "size": 4, "sha256": "a"},
-        {"path": "size.bin", "size": 5, "sha256": "b"},
-        {"path": "content.bin", "size": 6, "sha256": "c"},
-        {"path": "same.bin", "size": 7, "sha256": "d"},
-    ]
-    destination = [
-        {"path": "size.bin", "size": 4, "sha256": "b"},
-        {"path": "content.bin", "size": 6, "sha256": "x"},
-        {"path": "same.bin", "size": 7, "sha256": "d"},
-        {"path": "extra.bin", "size": 1, "sha256": "e"},
-    ]
-    result = _sync_diff(source, destination, 2)
-    assert result["files_to_transfer_count"] == 3
-    assert result["files_truncated"] == 1
-    assert [item["reason"] for item in result["files_to_transfer"]] == [
-        "destination_missing",
-        "size_changed",
-    ]
-    assert result["unchanged_count"] == 1
-    assert result["destination_only"] == ["extra.bin"]
-    assert result["transfer_bytes"] == 15
 
 
 def test_kernel_outputs_are_bounded_with_explicit_marker():
@@ -1557,7 +1531,7 @@ def test_workspace_upload_batches_changed_files_into_one_verified_archive(
     assert result["progress_events_emitted"] == 1
 
 
-def test_workspace_sync_plan_filters_before_diff_and_has_stable_identity(
+def test_workspace_sync_selection_filters_before_diff(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     instance = manager(tmp_path, monkeypatch)
@@ -1578,26 +1552,16 @@ def test_workspace_sync_plan_filters_before_diff_and_has_stable_identity(
         }
 
     instance._remote_operation = remote
-    first, paths, changed, selected_name, lease = asyncio.run(
-        instance.workspace_sync_plan(
-            "push", str(source), "/content/workspace", "runtime", include=["src/**"]
-        )
-    )
-    second, *_ = asyncio.run(
-        instance.workspace_sync_plan(
+    paths, changed, selected_name, lease = asyncio.run(
+        instance.workspace_sync_selection(
             "push", str(source), "/content/workspace", "runtime", include=["src/**"]
         )
     )
 
-    assert first["plan_id"] == second["plan_id"]
     assert paths == ["src/train.py"]
     assert changed == ["src/train.py"]
     assert selected_name == "runtime"
     assert lease["lease_token"] == "b" * 32
-    assert first["files_to_transfer"][0]["reason"] == "size_changed"
-    assert first["excluded_count"] == 2
-    assert first["destination_only"] == ["remote-only.bin"]
-    assert first["speed_estimate"]["status"] == "insufficient_history"
 
 
 def test_workspace_upload_auto_does_not_gzip_media(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):

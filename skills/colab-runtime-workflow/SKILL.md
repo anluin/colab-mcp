@@ -17,8 +17,8 @@ walks caches, VCS metadata, historical checkpoints, or unrelated outputs.
    Prefer tracked source plus required configs/data; fetch public models and datasets directly on
    Colab instead of routing them through the local machine.
 5. Push that snapshot to a task-specific root such as `/content/workspaces/<task>/source`.
-   Reserve `/content/workspaces/<task>/artifacts` for outputs only. For large or uncertain changes,
-   inspect `dry_run=true`, then execute with its `plan_id` as `expected_plan_id`.
+   Reserve `/content/workspaces/<task>/artifacts` for outputs only. The sync computes and transfers
+   only the verified content-hash delta in a single call.
 6. For work expected to finish quickly, use `colab_execute` or `colab_run_command`.
 7. For uncertain or long work, use `colab_process_start` with `export_on_exit` targeting the
    dedicated artifact directory. Poll status and output with increasing intervals. A timeout does

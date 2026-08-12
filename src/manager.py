@@ -103,8 +103,6 @@ SYNC_ALWAYS_EXCLUDED = (
     "**/*.key",
     "**/*.pem",
 )
-SYNC_PLAN_VERSION = 1
-SYNC_PLAN_PREVIEW_LIMIT = 200
 
 
 class AutoExportRule(BaseModel):
@@ -536,44 +534,6 @@ def _sync_selected(path: str, include: tuple[str, ...]) -> tuple[bool, str | Non
     if include and not any(_sync_pattern_matches(path, pattern) for pattern in include):
         return False, "not_in_include"
     return True, None
-
-
-def _sync_plan_id(payload: dict[str, Any]) -> str:
-    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _sync_diff(
-    source: list[dict[str, Any]], destination: list[dict[str, Any]], preview_limit: int
-) -> dict[str, Any]:
-    destination_by_path = {item["path"]: item for item in destination}
-    source_paths = {item["path"] for item in source}
-    changed: list[dict[str, Any]] = []
-    unchanged = 0
-    transfer_bytes = 0
-    for item in source:
-        previous = destination_by_path.get(item["path"])
-        if previous is None:
-            reason = "destination_missing"
-        elif int(previous.get("size", -1)) != int(item["size"]):
-            reason = "size_changed"
-        elif previous.get("sha256") != item["sha256"]:
-            reason = "content_changed"
-        else:
-            unchanged += 1
-            continue
-        changed.append({**item, "reason": reason})
-        transfer_bytes += int(item["size"])
-    destination_only = sorted(path for path in destination_by_path if path not in source_paths)
-    return {
-        "files_to_transfer": changed[:preview_limit],
-        "files_truncated": max(0, len(changed) - preview_limit),
-        "files_to_transfer_count": len(changed),
-        "unchanged_count": unchanged,
-        "destination_only_count": len(destination_only),
-        "destination_only": destination_only[:preview_limit],
-        "transfer_bytes": transfer_bytes,
-    }
 
 
 def _build_workspace_bundle(
@@ -2343,7 +2303,7 @@ class ColabManager:
                 return None
             raise
 
-    async def workspace_sync_plan(
+    async def workspace_sync_selection(
         self,
         direction: Literal["push", "pull"],
         local_folder: str,
@@ -2353,11 +2313,8 @@ class ColabManager:
         max_files: int = 10_000,
         max_total_bytes: int = 1_000_000_000,
         lease_token: str | None = None,
-        preview_limit: int = SYNC_PLAN_PREVIEW_LIMIT,
-    ) -> tuple[dict[str, Any], list[str], list[str], str, dict[str, Any]]:
-        """Build the authoritative, side-effect-free plan used by workspace sync."""
-        if preview_limit < 1 or preview_limit > 1_000:
-            raise ValueError("preview_limit must be between 1 and 1000")
+    ) -> tuple[list[str], list[str], str, dict[str, Any]]:
+        """Select the safe source set and changed paths for one workspace sync."""
         normalized_include = tuple(dict.fromkeys(include or ()))
         if len(normalized_include) > 100:
             raise ValueError("include accepts at most 100 patterns")
@@ -2390,19 +2347,15 @@ class ColabManager:
             else []
         )
         local_files: list[Path] = []
-        local_excluded: list[dict[str, str]] = []
         for path in local_candidates:
             relative = PurePosixPath(*path.relative_to(local_root).parts).as_posix()
             accepted, reason = _sync_selected(relative, normalized_include)
             if accepted:
                 local_files.append(path)
-            else:
-                local_excluded.append({"path": relative, "reason": reason or "excluded"})
         local_manifest = await asyncio.to_thread(_workspace_manifest, local_root, local_files)
         source_all = local_manifest if direction == "push" else remote_manifest
         destination = remote_manifest if direction == "push" else local_manifest
         selected = source_all
-        excluded = local_excluded if direction == "push" else remote.get("excluded", [])
         if not selected:
             raise ValueError(
                 "Sync selection is empty; adjust local_folder, remote_folder, or include"
@@ -2416,40 +2369,13 @@ class ColabManager:
             raise ValueError(
                 f"Sync selection contains {selected_bytes} bytes; max_total_bytes is {max_total_bytes}"
             )
-        diff = _sync_diff(selected, destination, preview_limit)
-        identity = {
-            "version": SYNC_PLAN_VERSION,
-            "direction": direction,
-            "local_folder": str(local_root),
-            "remote_folder": remote_folder,
-            "runtime_fingerprint": getattr(session, "runtime_fingerprint", None),
-            "include": normalized_include,
-            "source": selected,
-            "destination": destination,
-        }
-        plan = {
-            "plan_id": _sync_plan_id(identity),
-            "direction": direction,
-            "local_folder": str(local_root),
-            "remote_folder": remote_folder,
-            "include": list(normalized_include),
-            "always_excluded": list(SYNC_ALWAYS_EXCLUDED),
-            "selected_count": len(selected),
-            "selected_bytes": selected_bytes,
-            "excluded_count": len(excluded),
-            "excluded": excluded[:preview_limit],
-            "excluded_truncated": max(0, len(excluded) - preview_limit),
-            "estimated_wire_bytes": diff["transfer_bytes"],
-            "speed_estimate": self._sync_speed_estimate(direction, diff["transfer_bytes"]),
-            **diff,
-        }
         destination_hashes = {item["path"]: item.get("sha256") for item in destination}
         changed_paths = [
             item["path"]
             for item in selected
             if destination_hashes.get(item["path"]) != item["sha256"]
         ]
-        return plan, [item["path"] for item in selected], changed_paths, session.name, lease
+        return [item["path"] for item in selected], changed_paths, session.name, lease
 
     async def workspace_upload(
         self,
