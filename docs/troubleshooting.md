@@ -106,6 +106,24 @@ worthwhile, or use `compression="gzip"` to force it. A gzip decode, size, or che
 the destination unpublished and removes transfer staging files; retry after confirming the runtime
 lease and source file are stable.
 
+## WebRTC connects but is slower than the proxy
+
+Peer throughput depends on NAT type, region, packet loss, relay choice, and runtime CPU. A successful
+ICE/DTLS connection is not evidence that it is faster. Inspect `data_transport`, `wire_bytes`, and
+`timings.data_transfer_seconds`. Auto mode records only verified bulk transfers and disables WebRTC
+for that direction when its median does not beat the authenticated path by at least 10%. Use
+`transport="kernel"` for a deterministic proxy path, or `transport="webrtc"` only while diagnosing
+ICE/TURN behavior. More `COLAB_MCP_WEBRTC_LANES` can hurt on two-core runtimes.
+
+`WebRTC endpoint answer timed out` means ICE gathering or endpoint startup did not complete.
+`WebRTC transfer timed out` means a connection opened but did not finish within the bounded window.
+Auto mode aborts peer endpoint processes, removes range stages, and resumes through the existing
+transport after a 90-second peer-transfer bound, then waits six hours before probing WebRTC again
+for that direction. Required WebRTC
+preserves the original resumable upload stage and reports failure.
+Validate JSON in `COLAB_MCP_WEBRTC_ICE_SERVERS`; TURN URLs normally require a username and
+credential. Do not paste long-lived relay credentials into logs or issue reports.
+
 ## GPU differs from the request
 
 Availability and entitlement are controlled by Colab. Call `colab_inspect` and use the actual GPU,

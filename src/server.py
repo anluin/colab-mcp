@@ -79,6 +79,12 @@ CompressionMode = Annotated[
         description="Wire compression: auto uses gzip only when worthwhile; gzip forces it; none disables it."
     ),
 ]
+TransferTransport = Annotated[
+    Literal["auto", "webrtc", "kernel"],
+    Field(
+        description="auto uses lease-bound WebRTC for bulk data and safely falls back; webrtc requires it; kernel uses the authenticated Colab proxy."
+    ),
+]
 CompressionMinBytes = Annotated[
     int,
     Field(
@@ -592,6 +598,7 @@ async def colab_workspace_sync(
     max_total_bytes: MaxTotalBytes = 1_000_000_000,
     max_files: MaxFiles = 10_000,
     compression: CompressionMode = "auto",
+    transport: TransferTransport = "auto",
     include: Annotated[
         list[str] | None,
         Field(
@@ -600,7 +607,7 @@ async def colab_workspace_sync(
         ),
     ] = None,
 ) -> dict:
-    """Incrementally sync one purposeful folder using SHA-256 and atomic publication. Use include for a positive selection. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
+    """Incrementally sync with verified WebRTC bulk transfer and safe proxy fallback. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
     local = Path(local_folder).expanduser().resolve()
     if direction == "push" and not local.is_dir():
         raise ValueError("local_folder must be an existing directory for push")
@@ -644,6 +651,7 @@ async def colab_workspace_sync(
             progress=progress,
             selected_paths=set(selected_paths),
             changed_paths=set(changed_paths),
+            transport=transport,
         )
     else:
         remote = await manager._remote_operation(
@@ -668,9 +676,20 @@ async def colab_workspace_sync(
             compression_min_savings=0.10,
             lease_token=lease_token,
             selected_paths=set(selected_paths),
+            transport=transport,
         )
-    transfer_seconds = float(result.get("timings", {}).get("data_transfer_seconds", 0))
-    manager._record_sync_speed(direction, int(result.get("wire_bytes", 0)), transfer_seconds)
+    transfer_seconds = float(
+        result.get(
+            "transport_data_seconds",
+            result.get("timings", {}).get("data_transfer_seconds", 0),
+        )
+    )
+    manager._record_sync_speed(
+        direction,
+        int(result.get("wire_bytes", 0)),
+        transfer_seconds,
+        result.get("data_transport"),
+    )
     return {
         "direction": direction,
         "mode": "content_hash_incremental",

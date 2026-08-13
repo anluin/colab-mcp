@@ -733,6 +733,277 @@ try:
         else:
             _cm_target.unlink()
         _cm_result = {{'removed': str(_cm_target), 'recursive': bool(_cm_payload.get('recursive'))}}
+    elif _cm_operation == 'p2p_ranges':
+        _cm_target = _cm_path(_cm_payload['path'])
+        if not _cm_target.is_file():
+            raise FileNotFoundError(str(_cm_target))
+        _cm_expected_size = int(_cm_payload['expected_size'])
+        _cm_max_total = int(_cm_payload['max_total_bytes'])
+        if (_cm_target.stat().st_size != _cm_expected_size
+                or not 0 <= _cm_expected_size <= _cm_max_total):
+            raise ValueError('WebRTC range source size changed or exceeds its bound')
+        _cm_ranges = _cm_payload['ranges']
+        if not isinstance(_cm_ranges, list) or not 1 <= len(_cm_ranges) <= 16:
+            raise ValueError('WebRTC transfer requires 1-16 ranges')
+        _cm_range_result = []
+        _cm_cursor = 0
+        with _cm_target.open('rb') as _cm_handle:
+            for _cm_range in _cm_ranges:
+                _cm_offset = int(_cm_range['offset'])
+                _cm_size = int(_cm_range['size'])
+                if _cm_offset != _cm_cursor or _cm_size <= 0 or _cm_offset + _cm_size > _cm_expected_size:
+                    raise ValueError('WebRTC ranges must be contiguous and bounded')
+                _cm_handle.seek(_cm_offset)
+                _cm_digest = _cm_hashlib.sha256()
+                _cm_remaining = _cm_size
+                while _cm_remaining:
+                    _cm_chunk = _cm_handle.read(min(1024 * 1024, _cm_remaining))
+                    if not _cm_chunk:
+                        raise ValueError('WebRTC range source ended early')
+                    _cm_digest.update(_cm_chunk)
+                    _cm_remaining -= len(_cm_chunk)
+                _cm_range_result.append({{
+                    'offset': _cm_offset, 'size': _cm_size,
+                    'sha256': _cm_digest.hexdigest(),
+                }})
+                _cm_cursor += _cm_size
+        if _cm_cursor != _cm_expected_size:
+            raise ValueError('WebRTC ranges do not cover the complete source')
+        _cm_result = {{'path': str(_cm_target), 'ranges': _cm_range_result}}
+    elif _cm_operation == 'p2p_assemble':
+        _cm_target = _cm_path(_cm_payload['target'])
+        if '.colab-mcp-wire-' not in _cm_target.name:
+            raise ValueError('WebRTC assembly requires a transfer staging path')
+        _cm_prefix_size = int(_cm_payload['prefix_size'])
+        _cm_expected_size = int(_cm_payload['expected_size'])
+        _cm_max_total = int(_cm_payload['max_total_bytes'])
+        if not 0 <= _cm_prefix_size <= _cm_expected_size <= _cm_max_total:
+            raise ValueError('invalid WebRTC assembly size')
+        if _cm_prefix_size and (not _cm_target.is_file()
+                                or _cm_target.stat().st_size != _cm_prefix_size):
+            raise ValueError('WebRTC assembly prefix changed')
+        _cm_parts = _cm_payload['parts']
+        if not isinstance(_cm_parts, list) or not 1 <= len(_cm_parts) <= 16:
+            raise ValueError('WebRTC assembly requires 1-16 parts')
+        _cm_temporary = _cm_target.with_name(
+            _cm_target.name + '.colab-mcp-assemble-' + _cm_uuid.uuid4().hex)
+        _cm_digest = _cm_hashlib.sha256()
+        _cm_written = 0
+        _cm_part_paths = []
+        try:
+            with _cm_temporary.open('wb') as _cm_output:
+                if _cm_prefix_size:
+                    with _cm_target.open('rb') as _cm_prefix:
+                        _cm_remaining = _cm_prefix_size
+                        while _cm_remaining:
+                            _cm_chunk = _cm_prefix.read(min(1024 * 1024, _cm_remaining))
+                            if not _cm_chunk:
+                                raise ValueError('WebRTC assembly prefix ended early')
+                            _cm_output.write(_cm_chunk)
+                            _cm_digest.update(_cm_chunk)
+                            _cm_written += len(_cm_chunk)
+                            _cm_remaining -= len(_cm_chunk)
+                for _cm_part in _cm_parts:
+                    _cm_part_path = _cm_path(_cm_part['path'])
+                    if '.colab-mcp-wire-' not in _cm_part_path.name or not _cm_part_path.is_file():
+                        raise ValueError('invalid WebRTC assembly part')
+                    _cm_part_size = int(_cm_part['size'])
+                    if _cm_part_path.stat().st_size != _cm_part_size:
+                        raise ValueError('WebRTC assembly part size mismatch')
+                    _cm_part_digest = _cm_hashlib.sha256()
+                    with _cm_part_path.open('rb') as _cm_input:
+                        for _cm_chunk in iter(lambda: _cm_input.read(1024 * 1024), b''):
+                            _cm_output.write(_cm_chunk)
+                            _cm_digest.update(_cm_chunk)
+                            _cm_part_digest.update(_cm_chunk)
+                            _cm_written += len(_cm_chunk)
+                            if _cm_written > _cm_expected_size or _cm_written > _cm_max_total:
+                                raise ValueError('WebRTC assembly exceeded declared size')
+                    if _cm_part_digest.hexdigest() != _cm_part['sha256']:
+                        raise ValueError('WebRTC assembly part checksum mismatch')
+                    _cm_part_paths.append(_cm_part_path)
+                _cm_output.flush()
+                _cm_os.fsync(_cm_output.fileno())
+            if (_cm_written != _cm_expected_size
+                    or _cm_digest.hexdigest() != _cm_payload['expected_sha256']):
+                raise ValueError('WebRTC assembly checksum mismatch')
+            _cm_temporary.replace(_cm_target)
+            for _cm_part_path in _cm_part_paths:
+                _cm_part_path.unlink(missing_ok=True)
+            _cm_result = {{
+                **_cm_stat(_cm_target), 'sha256': _cm_digest.hexdigest(),
+                'parts': len(_cm_parts),
+            }}
+        finally:
+            _cm_temporary.unlink(missing_ok=True)
+    elif _cm_operation == 'p2p_prepare':
+        _cm_source = _cm_payload['source']
+        if not isinstance(_cm_source, str) or not 1 <= len(_cm_source.encode('utf-8')) <= 200_000:
+            raise ValueError('invalid WebRTC endpoint source')
+        if _cm_hashlib.sha256(_cm_source.encode('utf-8')).hexdigest() != _cm_payload['sha256']:
+            raise ValueError('WebRTC endpoint source checksum mismatch')
+        _cm_endpoint = _cm_state_root / 'p2p-endpoint.py'
+        _cm_existing = (
+            _cm_hashlib.sha256(_cm_endpoint.read_bytes()).hexdigest()
+            if _cm_endpoint.is_file() else None)
+        if _cm_existing != _cm_payload['sha256']:
+            _cm_endpoint.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            _cm_temporary = _cm_endpoint.with_suffix('.tmp')
+            _cm_temporary.write_text(_cm_source, encoding='utf-8')
+            _cm_os.chmod(_cm_temporary, 0o600)
+            _cm_temporary.replace(_cm_endpoint)
+        _cm_requirement = _cm_payload['requirement']
+        if not isinstance(_cm_requirement, str) or not _cm_requirement.startswith('aiortc=='):
+            raise ValueError('invalid WebRTC dependency requirement')
+        _cm_version = None
+        try:
+            import importlib.metadata as _cm_metadata_module
+            _cm_version = _cm_metadata_module.version('aiortc')
+        except Exception:
+            _cm_version = None
+        _cm_required_version = _cm_requirement.split('==', 1)[1]
+        _cm_installed = False
+        if _cm_version != _cm_required_version:
+            _cm_install = _cm_subprocess.run(
+                [_cm_sys.executable, '-m', 'pip', 'install', '--disable-pip-version-check',
+                 '--quiet', _cm_requirement], capture_output=True, text=True, timeout=240)
+            if _cm_install.returncode != 0:
+                raise RuntimeError('WebRTC dependency installation failed: '
+                                   + _cm_install.stderr[-1000:])
+            _cm_installed = True
+            _cm_version = _cm_required_version
+        _cm_result = {{
+            'ready': True, 'endpoint_sha256': _cm_payload['sha256'],
+            'aiortc_version': _cm_version, 'installed': _cm_installed,
+        }}
+    elif _cm_operation == 'p2p_start':
+        _cm_request_id = _cm_payload['request_id']
+        if (not isinstance(_cm_request_id, str) or len(_cm_request_id) != 32
+                or any(char not in '0123456789abcdef' for char in _cm_request_id)):
+            raise ValueError('request_id must be 32 lowercase hexadecimal characters')
+        _cm_direction = _cm_payload['direction']
+        if _cm_direction not in ('upload', 'download'):
+            raise ValueError('WebRTC direction must be upload or download')
+        _cm_transfer_path = _cm_path(_cm_payload['path'])
+        if _cm_direction == 'upload' and '.colab-mcp-wire-' not in _cm_transfer_path.name:
+            raise ValueError('WebRTC uploads require a transfer staging path')
+        if _cm_direction == 'download' and not _cm_transfer_path.is_file():
+            raise FileNotFoundError(str(_cm_transfer_path))
+        _cm_size = int(_cm_payload['size'])
+        _cm_offset = int(_cm_payload.get('offset', 0))
+        if not 0 <= _cm_offset <= _cm_size <= int(_cm_payload['max_total_bytes']):
+            raise ValueError('invalid WebRTC transfer size or offset')
+        _cm_source_offset = int(_cm_payload.get('source_offset', 0))
+        if _cm_source_offset < 0:
+            raise ValueError('invalid WebRTC source offset')
+        if (_cm_direction == 'download'
+                and _cm_source_offset + _cm_size > _cm_transfer_path.stat().st_size):
+            raise ValueError('WebRTC download range exceeds the source')
+        _cm_sha256 = _cm_payload['sha256']
+        _cm_secret = _cm_payload['secret']
+        if (not isinstance(_cm_sha256, str) or len(_cm_sha256) != 64
+                or any(char not in '0123456789abcdef' for char in _cm_sha256)):
+            raise ValueError('invalid WebRTC transfer checksum')
+        if (not isinstance(_cm_secret, str) or len(_cm_secret) != 64
+                or any(char not in '0123456789abcdef' for char in _cm_secret)):
+            raise ValueError('invalid WebRTC transfer secret')
+        _cm_offer = _cm_payload['offer']
+        if (not isinstance(_cm_offer, dict) or _cm_offer.get('type') != 'offer'
+                or not isinstance(_cm_offer.get('sdp'), str)
+                or len(_cm_offer['sdp']) > 200_000):
+            raise ValueError('invalid WebRTC offer')
+        _cm_ice_servers = _cm_payload['ice_servers']
+        if not isinstance(_cm_ice_servers, list) or not 0 <= len(_cm_ice_servers) <= 8:
+            raise ValueError('invalid WebRTC ICE server list')
+        _cm_endpoint = _cm_state_root / 'p2p-endpoint.py'
+        if not _cm_endpoint.is_file():
+            raise RuntimeError('WebRTC endpoint is not prepared')
+        _cm_request_root = _cm_state_root / 'p2p' / _cm_request_id
+        if _cm_request_root.exists():
+            raise FileExistsError('WebRTC request already exists')
+        _cm_request_root.mkdir(mode=0o700, parents=True)
+        _cm_config_path = _cm_request_root / 'config.json'
+        _cm_answer_path = _cm_request_root / 'answer.json'
+        _cm_result_path = _cm_request_root / 'result.json'
+        _cm_config = {{
+            'runtime_fingerprint': _cm_actual_fingerprint,
+            'lease_token': _cm_operation_lease_token,
+            'fingerprint_path': str(_cm_incarnation_path),
+            'lease_path': str(_cm_operation_lease_path),
+            'content_root': str(_cm_root),
+            'direction': _cm_direction,
+            'path': str(_cm_transfer_path),
+            'size': _cm_size,
+            'offset': _cm_offset,
+            'source_offset': _cm_source_offset,
+            'sha256': _cm_sha256,
+            'secret': _cm_secret,
+            'offer': _cm_offer,
+            'ice_servers': _cm_ice_servers,
+            'connect_timeout': float(_cm_payload['connect_timeout']),
+            'transfer_timeout': float(_cm_payload['transfer_timeout']),
+            'answer_path': str(_cm_answer_path),
+            'result_path': str(_cm_result_path),
+        }}
+        _cm_config_path.write_text(_cm_json.dumps(_cm_config), encoding='utf-8')
+        _cm_os.chmod(_cm_config_path, 0o600)
+        _cm_stdout = (_cm_request_root / 'stdout.log').open('wb')
+        _cm_stderr = (_cm_request_root / 'stderr.log').open('wb')
+        _cm_process = _cm_subprocess.Popen(
+            [_cm_sys.executable, str(_cm_endpoint), str(_cm_config_path)],
+            stdin=_cm_subprocess.DEVNULL, stdout=_cm_stdout, stderr=_cm_stderr,
+            start_new_session=True)
+        _cm_stdout.close()
+        _cm_stderr.close()
+        (_cm_request_root / 'pid').write_text(str(_cm_process.pid), encoding='ascii')
+        _cm_deadline = _cm_time.monotonic() + float(_cm_payload['connect_timeout'])
+        while not _cm_answer_path.is_file() and _cm_time.monotonic() < _cm_deadline:
+            if _cm_result_path.is_file():
+                _cm_early_result = _cm_json.loads(_cm_result_path.read_text(encoding='utf-8'))
+                raise RuntimeError(_cm_early_result.get('error', 'WebRTC endpoint exited early'))
+            if _cm_process.poll() is not None:
+                _cm_failure = (_cm_request_root / 'stderr.log').read_text(
+                    encoding='utf-8', errors='replace')[-1000:]
+                raise RuntimeError('WebRTC endpoint exited before answering: ' + _cm_failure)
+            _cm_time.sleep(0.05)
+        if not _cm_answer_path.is_file():
+            _cm_os.killpg(_cm_process.pid, _cm_signal.SIGTERM)
+            raise TimeoutError('WebRTC endpoint answer timed out')
+        _cm_answer = _cm_json.loads(_cm_answer_path.read_text(encoding='utf-8'))
+        _cm_result = {{
+            'request_id': _cm_request_id, 'answer': _cm_answer,
+            'endpoint_pid': _cm_process.pid, 'protocol_version': 1,
+        }}
+    elif _cm_operation == 'p2p_finish':
+        _cm_request_id = _cm_payload['request_id']
+        if (not isinstance(_cm_request_id, str) or len(_cm_request_id) != 32
+                or any(char not in '0123456789abcdef' for char in _cm_request_id)):
+            raise ValueError('invalid WebRTC request_id')
+        _cm_request_root = _cm_state_root / 'p2p' / _cm_request_id
+        _cm_result_path = _cm_request_root / 'result.json'
+        _cm_deadline = _cm_time.monotonic() + float(_cm_payload.get('wait_seconds', 15))
+        while not _cm_result_path.is_file() and _cm_time.monotonic() < _cm_deadline:
+            _cm_time.sleep(0.05)
+        if not _cm_result_path.is_file():
+            raise TimeoutError('WebRTC endpoint completion timed out')
+        _cm_p2p_result = _cm_json.loads(_cm_result_path.read_text(encoding='utf-8'))
+        if _cm_p2p_result.get('ok'):
+            _cm_shutil.rmtree(_cm_request_root, ignore_errors=True)
+        _cm_result = _cm_p2p_result
+    elif _cm_operation == 'p2p_abort':
+        _cm_request_id = _cm_payload['request_id']
+        if (not isinstance(_cm_request_id, str) or len(_cm_request_id) != 32
+                or any(char not in '0123456789abcdef' for char in _cm_request_id)):
+            raise ValueError('invalid WebRTC request_id')
+        _cm_request_root = _cm_state_root / 'p2p' / _cm_request_id
+        _cm_pid_path = _cm_request_root / 'pid'
+        if _cm_pid_path.is_file():
+            try:
+                _cm_os.killpg(int(_cm_pid_path.read_text(encoding='ascii')), _cm_signal.SIGTERM)
+            except (ProcessLookupError, ValueError):
+                pass
+        _cm_shutil.rmtree(_cm_request_root, ignore_errors=True)
+        _cm_result = {{'request_id': _cm_request_id, 'aborted': True}}
     elif _cm_operation == 'inspect':
         _cm_disk = _cm_shutil.disk_usage(_cm_root)
         _cm_memory = {{}}

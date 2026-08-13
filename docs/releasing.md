@@ -6,6 +6,9 @@
    For durability releases, run `scripts/live_acceptance.py` once with T4 and once with L4. Record
    all phase evidence and execute each `--fail-after` boundary when quota permits; failure runs must
    also end with zero leaked assignments.
+   Run `scripts/live_p2p_acceptance.py` as a standalone CLI process for forced WebRTC and kernel
+   transports, verify the round-trip hash, and audit assignments after normal completion and one
+   interrupted run. Do not use a live MCP worker as the acceptance target.
 3. Audit tracked and ignored files for credentials, state, endpoints, build outputs, and temporary
    artifacts.
 4. Update the project version and lockfile; Git history and release notes are the changelog.

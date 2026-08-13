@@ -84,6 +84,12 @@ def test_process_output_reconciles_exit_count_with_live_spool_size():
         "lease_probe",
         "workspace_manifest",
         "workspace_bundle_publish",
+        "p2p_prepare",
+        "p2p_start",
+        "p2p_finish",
+        "p2p_abort",
+        "p2p_ranges",
+        "p2p_assemble",
         "process_start",
         "process_status",
         "process_list",
@@ -181,6 +187,21 @@ def test_workspace_bundle_publish_rejects_unsafe_or_undeclared_members():
     assert code.index("workspace bundle content checksum mismatch") < code.index(
         "_cm_staged_file.replace(_cm_destination)"
     )
+
+
+def test_p2p_operations_remain_lease_guarded_and_stage_only():
+    start = build_remote_code(
+        "p2p_start",
+        {
+            "runtime_fingerprint": "a" * 32,
+            "operation_lease_token": "b" * 32,
+        },
+    )
+    assemble = build_remote_code("p2p_assemble", {})
+    assert start.index("operation_lease_stale") < start.index("_cm_operation == 'p2p_start'")
+    assert "WebRTC uploads require a transfer staging path" in start
+    assert "WebRTC assembly requires a transfer staging path" in assemble
+    assert "WebRTC assembly checksum mismatch" in assemble
 
 
 @pytest.mark.parametrize("argv", [[], [""], [1]])

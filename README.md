@@ -251,9 +251,51 @@ wire SHA-256 values are verified, and results distinguish logical `total_bytes` 
 In `auto` mode, already-compressed image, audio, video, and archive formats bypass the expensive
 gzip trial pass. `colab_workspace_sync` is the single supported upload/download API;
 its direction selects push or pull while process export remains a lifecycle-specific operation.
-Bulk uploads stream native binary buffers over the authenticated kernel websocket; downloads use
-Jupyter's authenticated raw-files endpoint. Kernel execution is used only to establish the guarded
-receiver and publish verified staging, not to carry file bytes.
+Bulk data can use an end-to-end encrypted WebRTC data channel after the guarded kernel connection
+installs a pinned, checksum-verified endpoint script in the owned runtime. ICE signaling remains
+inside the authenticated kernel channel; file bytes then travel directly between peers, or through
+an explicitly configured TURN relay. The endpoint revalidates the runtime incarnation and operation
+lease before and after transfer. SHA-256 verification, resumable staging, size/file-count bounds,
+and atomic publication are identical for every transport.
+
+`transport="auto"` is the default. Files below 4 MiB use the authenticated Colab path to avoid
+ICE/DTLS startup. For bulk files, auto samples WebRTC and records verified throughput by direction;
+once both paths have measurements it keeps WebRTC only when its median is at least 10% faster.
+Connection or transfer failure falls back without publishing peer bytes and opens a six-hour
+per-direction circuit breaker before auto probes the peer path again. Use
+`transport="webrtc"` to require the peer path or `transport="kernel"` to disable it. Results report
+`data_transport` and per-file transport values. WebRTC is topology-dependent and is not assumed to
+be faster merely because a connection succeeds.
+
+The default ICE configuration uses public STUN for discovery only. Production TURN requires your
+own short-lived authenticated credentials; no open relay credentials are embedded. Configure a
+bounded JSON list in `COLAB_MCP_WEBRTC_ICE_SERVERS`, for example:
+
+```json
+[
+  {
+    "urls": ["turns:turn.example.com:5349?transport=tcp"],
+    "username": "temporary-user",
+    "credential": "temporary-password"
+  }
+]
+```
+
+`COLAB_MCP_WEBRTC_MIN_BYTES` changes the auto threshold (default 4194304).
+`COLAB_MCP_WEBRTC_LANES` enables 1-16 parallel peer associations (default 1); extra lanes should be
+benchmarked because they can reduce throughput on small or CPU-constrained runtimes. TURN
+credentials cross only the authenticated kernel signaling channel, are handed to the endpoint in
+an owner-readable launch file that is removed on startup, and are never returned or logged.
+
+Run the opt-in end-to-end acceptance outside MCP with a dedicated runtime:
+
+```bash
+uv run python scripts/live_p2p_acceptance.py --size-mib 32 --transport webrtc --lanes 1
+```
+
+The harness reports allocation, push, pull, hash verification, and release phases. It uses an
+isolated session/state root and releases the runtime in `finally`; after interruption, audit account
+assignments before deleting recovery state.
 
 An optional positive `include` list selects relative POSIX-glob paths after mandatory exclusions
 for VCS data, environments, caches, and common secret-key files. Each sync computes the verified

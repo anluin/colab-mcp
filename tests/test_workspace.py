@@ -44,5 +44,39 @@ def test_workspace_pull_rejects_single_remote_file(tmp_path, monkeypatch):
         )
 
 
+def test_workspace_transport_selection_reaches_manager(tmp_path, monkeypatch):
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "main.py").write_text("VALUE = 1\n", encoding="utf-8")
+    seen = {}
+
+    async def selection(**_kwargs):
+        return ["main.py"], ["main.py"], "runtime", {"lease_token": "b" * 32}
+
+    async def upload(**kwargs):
+        seen.update(kwargs)
+        return {
+            "wire_bytes": 10,
+            "data_transport": "kernel_websocket",
+            "timings": {"data_transfer_seconds": 1},
+        }
+
+    monkeypatch.setattr(server.manager, "workspace_sync_selection", selection)
+    monkeypatch.setattr(server.manager, "workspace_upload", upload)
+    monkeypatch.setattr(server.manager, "_record_sync_speed", lambda *_args: None)
+    result = asyncio.run(
+        server.colab_workspace_sync(
+            "push",
+            str(source),
+            Progress(),
+            session="runtime",
+            lease_token="b" * 32,
+            transport="kernel",
+        )
+    )
+    assert seen["transport"] == "kernel"
+    assert result["data_transport"] == "kernel_websocket"
+
+
 async def _stable_probe(_session):
     return {"lease_token": "b" * 32}

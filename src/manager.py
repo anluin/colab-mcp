@@ -11,6 +11,7 @@ import json
 import logging
 import math
 import os
+import secrets
 import shutil
 import tarfile
 import tempfile
@@ -34,6 +35,17 @@ from nbformat.v4 import new_output
 from pydantic import BaseModel, Field, field_validator
 
 from .colab_adapter import binary_upload, kernel_client
+from .p2p import (
+    P2P_DEPENDENCY,
+    P2P_ENDPOINT_SHA256,
+    P2P_ENDPOINT_SOURCE,
+    P2PError,
+    ice_servers_from_environment,
+    p2p_lane_count,
+    p2p_min_bytes,
+    should_use_p2p,
+    transfer_file,
+)
 from .remote import (
     DEFAULT_OUTPUT_LIMIT,
     DEFAULT_PROCESS_OUTPUT_LIMIT,
@@ -386,6 +398,38 @@ def _file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _file_range_sha256(path: Path, offset: int, size: int) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        handle.seek(offset)
+        remaining = size
+        while remaining:
+            chunk = handle.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError("File ended before the requested checksum range")
+            digest.update(chunk)
+            remaining -= len(chunk)
+    return digest.hexdigest()
+
+
+def _assemble_local_ranges(
+    parts: list[Path], destination: Path, expected_size: int, expected_sha256: str
+) -> None:
+    digest = hashlib.sha256()
+    written = 0
+    with destination.open("wb") as output:
+        for part in parts:
+            with part.open("rb") as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    output.write(chunk)
+                    digest.update(chunk)
+                    written += len(chunk)
+        output.flush()
+        os.fsync(output.fileno())
+    if written != expected_size or digest.hexdigest() != expected_sha256:
+        raise RuntimeError("Assembled WebRTC ranges failed size or checksum verification")
+
+
 def _transfer_bounds(chunk_size: int, max_total_bytes: int, max_files: int) -> None:
     if not 1 <= chunk_size <= MAX_TRANSFER_CHUNK:
         raise ValueError(f"chunk_size must be between 1 and {MAX_TRANSFER_CHUNK}")
@@ -496,6 +540,32 @@ def _raw_download_to_file(
         raise RuntimeError("Raw download wire checksum mismatch")
     if content_written != content_bytes or content_digest.hexdigest() != content_checksum:
         raise RuntimeError("Raw download content checksum mismatch")
+
+
+def _decode_download_wire_file(
+    source: Path,
+    destination: Path,
+    content_bytes: int,
+    content_checksum: str,
+    max_total_bytes: int,
+) -> None:
+    """Expand one already-verified gzip wire file under the original bounds."""
+    digest = hashlib.sha256()
+    written = 0
+    with gzip.open(source, "rb") as input_handle, destination.open("wb") as output_handle:
+        while True:
+            chunk = input_handle.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > content_bytes or written > max_total_bytes:
+                raise RuntimeError("Decompressed WebRTC transfer exceeded declared size bound")
+            digest.update(chunk)
+            output_handle.write(chunk)
+        output_handle.flush()
+        os.fsync(output_handle.fileno())
+    if written != content_bytes or digest.hexdigest() != content_checksum:
+        raise RuntimeError("WebRTC download content checksum mismatch")
 
 
 def _workspace_manifest(root: Path, files: list[Path]) -> list[dict[str, Any]]:
@@ -694,6 +764,7 @@ class ColabManager:
         # probe must not invalidate an already-running transfer locally; the
         # runtime enforces the same bounded, expiring lease set.
         self._operation_leases: dict[str, dict[str, str]] = {}
+        self._p2p_endpoints: dict[str, str] = {}
         self._keepalives: dict[str, asyncio.Task] = {}
         self.keepalive_seconds = int(os.environ.get("COLAB_MCP_KEEPALIVE_SECONDS", "60"))
         self._export_watchers: dict[tuple[str, str], asyncio.Task] = {}
@@ -733,7 +804,9 @@ class ColabManager:
             ],
         }
 
-    def _record_sync_speed(self, direction: str, wire_bytes: int, seconds: float) -> None:
+    def _record_sync_speed(
+        self, direction: str, wire_bytes: int, seconds: float, transport: str | None = None
+    ) -> None:
         if wire_bytes <= 0 or seconds <= 0:
             return
         try:
@@ -748,6 +821,7 @@ class ColabManager:
                 "mib_per_second": wire_bytes / (1024 * 1024) / seconds,
                 "wire_bytes": wire_bytes,
                 "seconds": seconds,
+                "transport": transport,
                 "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
             }
         )
@@ -756,6 +830,77 @@ class ColabManager:
         _secure_permissions(temporary, 0o600)
         temporary.replace(self.sync_history_path)
         _secure_permissions(self.sync_history_path, 0o600)
+
+    def _record_transport_failure(self, direction: str, wire_bytes: int, error: Exception) -> None:
+        try:
+            records = json.loads(self.sync_history_path.read_text(encoding="utf-8"))
+            if not isinstance(records, list):
+                records = []
+        except (OSError, json.JSONDecodeError):
+            records = []
+        records.append(
+            {
+                "direction": direction,
+                "transport": "webrtc",
+                "status": "failed",
+                "wire_bytes": wire_bytes,
+                "error_type": type(error).__name__,
+                "observed_at": datetime.datetime.now(datetime.UTC).isoformat(),
+            }
+        )
+        temporary = self.sync_history_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(records[-40:], indent=2), encoding="utf-8")
+        _secure_permissions(temporary, 0o600)
+        temporary.replace(self.sync_history_path)
+        _secure_permissions(self.sync_history_path, 0o600)
+
+    def _preferred_transfer_transport(self, direction: str, requested: str, wire_bytes: int) -> str:
+        """Use measured bulk throughput as an automatic WebRTC circuit breaker."""
+        if requested != "auto" or wire_bytes < p2p_min_bytes():
+            return requested
+        try:
+            records = json.loads(self.sync_history_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return requested
+        bulk = [
+            item
+            for item in records
+            if item.get("direction") == direction
+            and int(item.get("wire_bytes", 0)) >= p2p_min_bytes()
+        ]
+        failures = [
+            item
+            for item in bulk
+            if item.get("transport") == "webrtc" and item.get("status") == "failed"
+        ]
+        if failures:
+            try:
+                failed_at = datetime.datetime.fromisoformat(str(failures[-1]["observed_at"]))
+            except (KeyError, TypeError, ValueError):
+                failed_at = datetime.datetime.now(datetime.UTC)
+            if datetime.datetime.now(datetime.UTC) - failed_at < datetime.timedelta(hours=6):
+                return "kernel"
+        p2p_samples = [
+            float(item["mib_per_second"])
+            for item in bulk
+            if item.get("transport") == "webrtc"
+            and item.get("status") != "failed"
+            and float(item.get("mib_per_second", 0)) > 0
+        ][-5:]
+        proxy_samples = [
+            float(item["mib_per_second"])
+            for item in bulk
+            if item.get("transport") in {None, "kernel_websocket", "authenticated_files_proxy"}
+            and float(item.get("mib_per_second", 0)) > 0
+        ][-20:]
+        if p2p_samples and not proxy_samples:
+            return "kernel"
+        if not p2p_samples or not proxy_samples:
+            return requested
+        p2p_typical = sorted(p2p_samples)[len(p2p_samples) // 2]
+        proxy_typical = sorted(proxy_samples)[len(proxy_samples) // 2]
+        # Direct transport must win clearly enough to repay ICE/DTLS startup.
+        return "webrtc" if p2p_typical >= proxy_typical * 1.10 else "kernel"
 
     def _kernel_lock(self, name: str) -> asyncio.Lock:
         with self._kernel_clients_guard:
@@ -2247,6 +2392,419 @@ class ColabManager:
         async with self._kernel_lock(session.name):
             return await asyncio.to_thread(connect_and_upload)
 
+    async def _prepare_p2p_endpoint(self, session: ManagedSessionState, lease_token: str) -> None:
+        fingerprint = str(session.runtime_fingerprint or "")
+        if self._p2p_endpoints.get(session.name) == fingerprint:
+            return
+        prepared = await self._remote_operation(
+            "p2p_prepare",
+            {
+                "source": P2P_ENDPOINT_SOURCE,
+                "sha256": P2P_ENDPOINT_SHA256,
+                "requirement": P2P_DEPENDENCY,
+            },
+            session.name,
+            timeout=300,
+            lease_token=lease_token,
+        )
+        if not prepared.get("ready") or prepared.get("endpoint_sha256") != P2P_ENDPOINT_SHA256:
+            raise P2PError("Colab WebRTC endpoint preparation was not verified")
+        self._p2p_endpoints[session.name] = fingerprint
+
+    async def _p2p_transfer_file(
+        self,
+        *,
+        direction: Literal["upload", "download"],
+        local_path: Path,
+        remote_path: str,
+        expected_size: int,
+        expected_sha256: str,
+        offset: int,
+        source_offset: int = 0,
+        max_total_bytes: int,
+        session: ManagedSessionState,
+        lease_token: str,
+        transfer_timeout_override: float | None = None,
+    ) -> dict[str, Any]:
+        await self._prepare_p2p_endpoint(session, lease_token)
+        request_id = uuid.uuid4().hex
+        secret = secrets.token_hex(32)
+        ice_servers = ice_servers_from_environment()
+        connect_timeout = 45.0
+        # A direct path can be extremely slow on congested or relayed networks.
+        # Keep failure bounded, but do not turn a slow verified transfer into a
+        # false transport failure before the existing 15-minute sync allowance.
+        transfer_timeout = transfer_timeout_override or min(
+            3_600.0, max(900.0, expected_size / (32 * 1024))
+        )
+
+        async def start_remote(offer: dict[str, str]) -> dict[str, Any]:
+            try:
+                return await self._remote_operation(
+                    "p2p_start",
+                    {
+                        "request_id": request_id,
+                        "direction": direction,
+                        "path": remote_path,
+                        "size": expected_size,
+                        "offset": offset,
+                        "source_offset": source_offset,
+                        "sha256": expected_sha256,
+                        "secret": secret,
+                        "offer": offer,
+                        "ice_servers": ice_servers,
+                        "connect_timeout": connect_timeout,
+                        "transfer_timeout": transfer_timeout,
+                        "max_total_bytes": max_total_bytes,
+                    },
+                    session.name,
+                    timeout=connect_timeout + 15,
+                    lease_token=lease_token,
+                )
+            except BaseException:
+                with contextlib.suppress(BaseException):
+                    await self._remote_operation(
+                        "p2p_abort",
+                        {"request_id": request_id},
+                        session.name,
+                        timeout=15,
+                        lease_token=lease_token,
+                    )
+                raise
+
+        async def finish_remote(completed_request_id: str) -> dict[str, Any]:
+            return await self._remote_operation(
+                "p2p_finish",
+                {"request_id": completed_request_id, "wait_seconds": 15},
+                session.name,
+                timeout=20,
+                lease_token=lease_token,
+            )
+
+        async def abort_remote(aborted_request_id: str) -> None:
+            await self._remote_operation(
+                "p2p_abort",
+                {"request_id": aborted_request_id},
+                session.name,
+                timeout=15,
+                lease_token=lease_token,
+            )
+
+        return await transfer_file(
+            direction=direction,
+            local_path=local_path,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            offset=offset,
+            local_offset=source_offset if direction == "upload" else 0,
+            secret=secret,
+            ice_servers=ice_servers,
+            start_remote=start_remote,
+            finish_remote=finish_remote,
+            abort_remote=abort_remote,
+            connect_timeout=connect_timeout,
+            transfer_timeout=transfer_timeout,
+        )
+
+    async def _upload_wire_file(
+        self,
+        source: Path,
+        remote_path: str,
+        offset: int,
+        wire_bytes: int,
+        wire_checksum: str,
+        max_total_bytes: int,
+        session: ManagedSessionState,
+        lease_token: str,
+        transport: str,
+    ) -> dict[str, Any]:
+        selected_transport = self._preferred_transfer_transport("push", transport, wire_bytes)
+        if should_use_p2p(selected_transport, wire_bytes):
+            try:
+                return await self._parallel_p2p_upload(
+                    source=source,
+                    remote_path=remote_path,
+                    offset=offset,
+                    wire_bytes=wire_bytes,
+                    wire_checksum=wire_checksum,
+                    max_total_bytes=max_total_bytes,
+                    session=session,
+                    lease_token=lease_token,
+                    transfer_timeout_override=None if transport == "webrtc" else 90.0,
+                )
+            except Exception as error:
+                if transport == "webrtc":
+                    raise
+                self._record_transport_failure("push", wire_bytes, error)
+                logger.warning(
+                    "webrtc_upload_fallback session=%s error_type=%s",
+                    session.name,
+                    type(error).__name__,
+                )
+        result = await self._binary_upload_file(source, remote_path, offset, session, lease_token)
+        result["transport"] = "kernel_websocket"
+        return result
+
+    async def _parallel_p2p_upload(
+        self,
+        *,
+        source: Path,
+        remote_path: str,
+        offset: int,
+        wire_bytes: int,
+        wire_checksum: str,
+        max_total_bytes: int,
+        session: ManagedSessionState,
+        lease_token: str,
+        transfer_timeout_override: float | None,
+    ) -> dict[str, Any]:
+        started = time.monotonic()
+        await self._prepare_p2p_endpoint(session, lease_token)
+        remaining = wire_bytes - offset
+        if remaining <= 0:
+            return {
+                "offset": wire_bytes,
+                "sha256": wire_checksum,
+                "seconds": 0.0,
+                "transport": "webrtc",
+                "lanes": 0,
+            }
+        lanes = p2p_lane_count(remaining)
+        ranges: list[tuple[int, int]] = []
+        cursor = offset
+        for index in range(lanes):
+            lane_size = remaining // lanes + (1 if index < remaining % lanes else 0)
+            ranges.append((cursor, lane_size))
+            cursor += lane_size
+        checksums = await asyncio.gather(
+            *(asyncio.to_thread(_file_range_sha256, source, start, size) for start, size in ranges)
+        )
+        part_paths = [f"{remote_path}.colab-mcp-wire-lane-{uuid.uuid4().hex}" for _ in ranges]
+        assembled = False
+        try:
+            await asyncio.gather(
+                *(
+                    self._p2p_transfer_file(
+                        direction="upload",
+                        local_path=source,
+                        remote_path=part_paths[index],
+                        expected_size=size,
+                        expected_sha256=checksums[index],
+                        offset=0,
+                        source_offset=start,
+                        max_total_bytes=max_total_bytes,
+                        session=session,
+                        lease_token=lease_token,
+                        transfer_timeout_override=transfer_timeout_override,
+                    )
+                    for index, (start, size) in enumerate(ranges)
+                )
+            )
+            result = await self._remote_operation(
+                "p2p_assemble",
+                {
+                    "target": remote_path,
+                    "prefix_size": offset,
+                    "parts": [
+                        {"path": part_paths[index], "size": size, "sha256": checksums[index]}
+                        for index, (_start, size) in enumerate(ranges)
+                    ],
+                    "expected_size": wire_bytes,
+                    "expected_sha256": wire_checksum,
+                    "max_total_bytes": max_total_bytes,
+                },
+                session.name,
+                timeout=300,
+                lease_token=lease_token,
+            )
+            assembled = True
+            return {
+                "offset": int(result["size"]),
+                "sha256": result["sha256"],
+                "seconds": time.monotonic() - started,
+                "transport": "webrtc",
+                "lanes": lanes,
+            }
+        finally:
+            if not assembled:
+                for part_path in part_paths:
+                    with contextlib.suppress(BaseException):
+                        await self._remote_operation(
+                            "fs_remove",
+                            {"path": part_path, "recursive": False, "missing_ok": True},
+                            session.name,
+                            timeout=15,
+                            lease_token=lease_token,
+                        )
+
+    async def _parallel_p2p_download(
+        self,
+        *,
+        session: ManagedSessionState,
+        remote_path: str,
+        destination: Path,
+        wire_bytes: int,
+        wire_checksum: str,
+        max_total_bytes: int,
+        lease_token: str,
+        transfer_timeout_override: float | None,
+    ) -> int:
+        await self._prepare_p2p_endpoint(session, lease_token)
+        if wire_bytes == 0:
+            await self._p2p_transfer_file(
+                direction="download",
+                local_path=destination,
+                remote_path=remote_path,
+                expected_size=0,
+                expected_sha256=wire_checksum,
+                offset=0,
+                source_offset=0,
+                max_total_bytes=max_total_bytes,
+                session=session,
+                lease_token=lease_token,
+                transfer_timeout_override=transfer_timeout_override,
+            )
+            return 1
+        lanes = p2p_lane_count(wire_bytes)
+        ranges: list[tuple[int, int]] = []
+        cursor = 0
+        for index in range(lanes):
+            lane_size = wire_bytes // lanes + (1 if index < wire_bytes % lanes else 0)
+            ranges.append((cursor, lane_size))
+            cursor += lane_size
+        manifest = await self._remote_operation(
+            "p2p_ranges",
+            {
+                "path": remote_path,
+                "ranges": [{"offset": start, "size": size} for start, size in ranges],
+                "expected_size": wire_bytes,
+                "expected_sha256": wire_checksum,
+                "max_total_bytes": max_total_bytes,
+            },
+            session.name,
+            timeout=300,
+            lease_token=lease_token,
+        )
+        parts: list[Path] = []
+        try:
+            for _ in ranges:
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix="colab-mcp-webrtc-range-", suffix=".part"
+                )
+                os.close(descriptor)
+                parts.append(Path(temporary_name))
+            await asyncio.gather(
+                *(
+                    self._p2p_transfer_file(
+                        direction="download",
+                        local_path=parts[index],
+                        remote_path=remote_path,
+                        expected_size=int(item["size"]),
+                        expected_sha256=str(item["sha256"]),
+                        offset=0,
+                        source_offset=int(item["offset"]),
+                        max_total_bytes=max_total_bytes,
+                        session=session,
+                        lease_token=lease_token,
+                        transfer_timeout_override=transfer_timeout_override,
+                    )
+                    for index, item in enumerate(manifest["ranges"])
+                )
+            )
+            await asyncio.to_thread(
+                _assemble_local_ranges, parts, destination, wire_bytes, wire_checksum
+            )
+            return lanes
+        finally:
+            for part in parts:
+                part.unlink(missing_ok=True)
+
+    async def _download_wire_file(
+        self,
+        session: ManagedSessionState,
+        remote_path: str,
+        destination: Path,
+        codec: str,
+        content_bytes: int,
+        wire_bytes: int,
+        wire_checksum: str,
+        content_checksum: str,
+        max_total_bytes: int,
+        chunk_size: int,
+        lease_token: str,
+        transport: str,
+    ) -> dict[str, Any]:
+        selected_transport = self._preferred_transfer_transport("pull", transport, wire_bytes)
+        if should_use_p2p(selected_transport, wire_bytes):
+            p2p_started = time.monotonic()
+            wire_destination = destination
+            temporary_wire: Path | None = None
+            if codec == "gzip":
+                descriptor, temporary_name = tempfile.mkstemp(
+                    prefix="colab-mcp-webrtc-", suffix=".gz"
+                )
+                os.close(descriptor)
+                temporary_wire = Path(temporary_name)
+                wire_destination = temporary_wire
+            try:
+                await self._parallel_p2p_download(
+                    session=session,
+                    remote_path=remote_path,
+                    destination=wire_destination,
+                    wire_bytes=wire_bytes,
+                    wire_checksum=wire_checksum,
+                    max_total_bytes=max_total_bytes,
+                    lease_token=lease_token,
+                    transfer_timeout_override=None if transport == "webrtc" else 90.0,
+                )
+                if codec == "gzip":
+                    if temporary_wire is None:
+                        raise AssertionError("missing compressed WebRTC staging file")
+                    await asyncio.to_thread(
+                        _decode_download_wire_file,
+                        temporary_wire,
+                        destination,
+                        content_bytes,
+                        content_checksum,
+                        max_total_bytes,
+                    )
+                elif content_bytes != wire_bytes or content_checksum != wire_checksum:
+                    raise RuntimeError("Uncompressed WebRTC metadata is inconsistent")
+                return {
+                    "transport": "webrtc",
+                    "seconds": time.monotonic() - p2p_started,
+                }
+            except Exception as error:
+                destination.unlink(missing_ok=True)
+                if transport == "webrtc":
+                    raise
+                self._record_transport_failure("pull", wire_bytes, error)
+                logger.warning(
+                    "webrtc_download_fallback session=%s error_type=%s",
+                    session.name,
+                    type(error).__name__,
+                )
+            finally:
+                if temporary_wire is not None:
+                    temporary_wire.unlink(missing_ok=True)
+        proxy_started = time.monotonic()
+        await self._raw_download_file(
+            session,
+            remote_path,
+            destination,
+            codec,
+            content_bytes,
+            wire_bytes,
+            wire_checksum,
+            content_checksum,
+            max_total_bytes,
+            chunk_size,
+        )
+        return {
+            "transport": "authenticated_files_proxy",
+            "seconds": time.monotonic() - proxy_started,
+        }
+
     async def _raw_download_file(
         self,
         session: ManagedSessionState,
@@ -2395,8 +2953,10 @@ class ColabManager:
         progress: ProgressCallback | None = None,
         selected_paths: set[str] | None = None,
         changed_paths: set[str] | None = None,
+        transport: str = "auto",
     ) -> dict[str, Any]:
         """Push a directory delta as one verified bundle instead of per-file RPCs."""
+        should_use_p2p(transport, 0)
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
         compression, _, compression_min_savings = _compression_settings(
             compression, 0, compression_min_savings
@@ -2481,6 +3041,8 @@ class ColabManager:
                         "total_seconds": round(time.monotonic() - operation_started, 3),
                     },
                     "strategy": "verified_bundle_delta",
+                    "data_transport": "none",
+                    "transport_data_seconds": 0.0,
                     "staging_cleanup": "no staging required",
                 }
             bundle, codec, wire_bytes, wire_checksum = await asyncio.to_thread(
@@ -2528,8 +3090,16 @@ class ColabManager:
                     )
             transfer_started = time.monotonic()
             resumed_from = staged_offset
-            result = await self._binary_upload_file(
-                bundle, staging_path, staged_offset, session, lease_token
+            result = await self._upload_wire_file(
+                bundle,
+                staging_path,
+                staged_offset,
+                wire_bytes,
+                wire_checksum,
+                max_total_bytes,
+                session,
+                lease_token,
+                transport,
             )
             staged_offset = int(result["offset"])
             if staged_offset != wire_bytes or result["sha256"] != wire_checksum:
@@ -2592,6 +3162,8 @@ class ColabManager:
                     "total_seconds": round(time.monotonic() - operation_started, 3),
                 },
                 "strategy": "verified_bundle_delta",
+                "data_transport": result["transport"],
+                "transport_data_seconds": round(float(result["seconds"]), 3),
                 "staging_cleanup": "published bundle removed; failed bundle preserved for resume",
             }
         except Exception as error:
@@ -2638,8 +3210,10 @@ class ColabManager:
         lease_token: str | None = None,
         transfer_id: str | None = None,
         progress: ProgressCallback | None = None,
+        transport: str = "auto",
     ) -> dict[str, Any]:
         """Upload resumable files under one operation-bound runtime lease."""
+        should_use_p2p(transport, 0)
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
         compression, compression_min_bytes, compression_min_savings = _compression_settings(
             compression, compression_min_bytes, compression_min_savings
@@ -2784,8 +3358,16 @@ class ColabManager:
                             )
                     transfer_started = time.monotonic()
                     resumed_from = staged_offset
-                    result = await self._binary_upload_file(
-                        wire_source, wire_temporary, staged_offset, session, lease_token
+                    result = await self._upload_wire_file(
+                        wire_source,
+                        wire_temporary,
+                        staged_offset,
+                        wire_bytes,
+                        wire_checksum,
+                        max_total_bytes,
+                        session,
+                        lease_token,
+                        transport,
                     )
                     staged_offset = int(result["offset"])
                     if staged_offset != wire_bytes or result["sha256"] != wire_checksum:
@@ -2868,6 +3450,7 @@ class ColabManager:
                             "wire_bytes": wire_bytes,
                             "wire_sha256": wire_checksum,
                             "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
+                            "transport": result["transport"],
                             "resumed_from_bytes": int(staged.get("size", 0)) if staged else 0,
                         }
                     )
@@ -2973,9 +3556,7 @@ class ColabManager:
             return root, [root]
         if selected_paths is not None:
             if len(selected_paths) > max_files:
-                raise ValueError(
-                    f"Remote transfer exceeds max_files={max_files}"
-                )
+                raise ValueError(f"Remote transfer exceeds max_files={max_files}")
             remote_root = PurePosixPath(root["path"])
             selected_files = []
             for selected in sorted(selected_paths):
@@ -3037,8 +3618,10 @@ class ColabManager:
         compression_min_savings: float = 0.10,
         lease_token: str | None = None,
         selected_paths: set[str] | None = None,
+        transport: str = "auto",
     ) -> dict[str, Any]:
         """Download files through checksummed chunks and atomic local replacement."""
+        should_use_p2p(transport, 0)
         _transfer_bounds(chunk_size, max_total_bytes, max_files)
         compression, compression_min_bytes, compression_min_savings = _compression_settings(
             compression, compression_min_bytes, compression_min_savings
@@ -3076,6 +3659,8 @@ class ColabManager:
         transferred: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
         transfer_seconds = 0.0
+        transport_data_seconds = 0.0
+        transports_used: set[str] = set()
         for item in files:
             relative = (
                 PurePosixPath(item["path"]).relative_to(remote_root)
@@ -3160,7 +3745,7 @@ class ColabManager:
                         )
                         remote_compressed = None
                 transfer_started = time.monotonic()
-                await self._raw_download_file(
+                transfer_result = await self._download_wire_file(
                     session,
                     wire_path,
                     temporary,
@@ -3171,7 +3756,12 @@ class ColabManager:
                     checksum,
                     max_total_bytes,
                     chunk_size,
+                    lease_token,
+                    transport,
                 )
+                data_transport = str(transfer_result["transport"])
+                transport_data_seconds += float(transfer_result["seconds"])
+                transports_used.add(data_transport)
                 transfer_seconds += time.monotonic() - transfer_started
                 temporary.replace(destination)
                 transferred.append(
@@ -3185,6 +3775,7 @@ class ColabManager:
                         "wire_bytes": wire_bytes,
                         "wire_sha256": wire_checksum,
                         "wire_ratio": round(wire_bytes / max(1, content_bytes), 6),
+                        "transport": data_transport,
                     }
                 )
             finally:
@@ -3203,6 +3794,12 @@ class ColabManager:
             "total_bytes": total,
             "wire_bytes": wire_total,
             "compression": compression,
+            "data_transport": (
+                next(iter(transports_used)) if len(transports_used) == 1 else "mixed"
+            )
+            if transports_used
+            else "none",
+            "transport_data_seconds": round(transport_data_seconds, 3),
             "lease": lease,
             "timings": {
                 "assignment_lookup_seconds": lease["assignment_lookup_seconds"],

@@ -33,6 +33,13 @@ runtimes are ephemeral execution environments.
   published and is removable only through constrained staging cleanup or explicit filesystem tools.
 - Compressed transfers enforce declared original sizes, total transfer limits, exact decompressed
   lengths, and SHA-256 checks before publication; malformed or expanding gzip data is discarded.
+- WebRTC transfers authenticate a per-transfer secret inside DTLS, validate the runtime fingerprint
+  and operation lease at endpoint start and completion, restrict uploads to hidden transfer staging
+  names, and verify every range plus the assembled wire object before publication. SDP contains no
+  OAuth/runtime proxy token. TURN credentials never appear in process arguments or tool results.
+- No unauthenticated TURN service is embedded. Operators supply bounded STUN/TURN URLs and
+  short-lived relay credentials through `COLAB_MCP_WEBRTC_ICE_SERVERS`; relay operators still see
+  network metadata, while DTLS protects file content.
 - Auto-export destinations are explicit host paths persisted in owner-only process state. Rules are
   capped, destinations must be unique, publication stays atomic, and automatic release is forbidden.
 - Process-export stages are deterministically scoped to an owned process and explicit paths. Failed

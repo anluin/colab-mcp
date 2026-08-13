@@ -1972,14 +1972,10 @@ def test_remote_positive_selection_does_not_walk_destination_extras(
     instance.filesystem_stat = stat
     instance.filesystem_list = listing
     root, files = asyncio.run(
-        instance._remote_files(
-            "/content/root", None, 1, selected_paths={"nested/wanted.json"}
-        )
+        instance._remote_files("/content/root", None, 1, selected_paths={"nested/wanted.json"})
     )
     assert root["kind"] == "directory"
-    assert files == [
-        {"path": "/content/root/nested/wanted.json", "kind": "file", "size": 4}
-    ]
+    assert files == [{"path": "/content/root/nested/wanted.json", "kind": "file", "size": 4}]
     assert seen == ["/content/root", "/content/root/nested/wanted.json"]
 
 
@@ -1994,9 +1990,7 @@ def test_remote_positive_selection_rejects_parent_traversal(
     instance.filesystem_stat = stat
     with pytest.raises(ValueError, match="Invalid selected remote path"):
         asyncio.run(
-            instance._remote_files(
-                "/content/root", None, 1, selected_paths={"../escape.json"}
-            )
+            instance._remote_files("/content/root", None, 1, selected_paths={"../escape.json"})
         )
 
 
