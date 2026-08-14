@@ -20,6 +20,7 @@ import time
 import uuid
 import zlib
 from collections.abc import Awaitable, Callable
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
@@ -42,7 +43,6 @@ from .p2p import (
     P2PError,
     ice_servers_from_environment,
     p2p_lane_count,
-    p2p_min_bytes,
     should_use_p2p,
     transfer_file,
 )
@@ -542,6 +542,91 @@ def _raw_download_to_file(
         raise RuntimeError("Raw download content checksum mismatch")
 
 
+def _proxy_download_lanes(wire_bytes: int) -> int:
+    raw = os.environ.get("COLAB_MCP_PROXY_DOWNLOAD_LANES", "4")
+    try:
+        configured = int(raw)
+    except ValueError as error:
+        raise ValueError("COLAB_MCP_PROXY_DOWNLOAD_LANES must be an integer") from error
+    if not 1 <= configured <= 16:
+        raise ValueError("COLAB_MCP_PROXY_DOWNLOAD_LANES must be between 1 and 16")
+    useful = max(1, (wire_bytes + 4 * 1024 * 1024 - 1) // (4 * 1024 * 1024))
+    return min(configured, useful)
+
+
+def _parallel_proxy_download_to_file(
+    session: Any,
+    remote_path: str,
+    destination: Path,
+    wire_bytes: int,
+    wire_checksum: str,
+    chunk_size: int,
+) -> int:
+    """Download verified byte ranges concurrently through the authenticated proxy."""
+    lanes = _proxy_download_lanes(wire_bytes)
+    quoted = quote(remote_path.strip("/"), safe="/")
+    url = session.url.rstrip("/") + "/files/" + quoted
+    common_headers = {
+        "X-Colab-Client-Agent": "colab-mcp",
+        "X-Colab-Runtime-Proxy-Token": session.token,
+        "Accept-Encoding": "identity",
+    }
+    params = {"authuser": "0", "colab-runtime-proxy-token": session.token}
+    ranges: list[tuple[int, int]] = []
+    cursor = 0
+    for index in range(lanes):
+        size = wire_bytes // lanes + (1 if index < wire_bytes % lanes else 0)
+        ranges.append((cursor, size))
+        cursor += size
+    with destination.open("wb") as handle:
+        handle.truncate(wire_bytes)
+
+    def download_range(start: int, size: int) -> int:
+        end = start + size - 1
+        response = requests.get(
+            url,
+            params=params,
+            headers={**common_headers, "Range": f"bytes={start}-{end}"},
+            stream=True,
+            timeout=(30, 120),
+        )
+        try:
+            response.raise_for_status()
+            if response.status_code != 206:
+                raise RuntimeError("Authenticated files proxy did not honor byte ranges")
+            content_range = response.headers.get("Content-Range", "")
+            if content_range != f"bytes {start}-{end}/{wire_bytes}":
+                raise RuntimeError("Authenticated files proxy returned a conflicting byte range")
+            written = 0
+            with destination.open("r+b", buffering=0) as handle:
+                handle.seek(start)
+                for data in response.iter_content(chunk_size):
+                    if not data:
+                        continue
+                    written += len(data)
+                    if written > size:
+                        raise RuntimeError("Authenticated range exceeded its declared size")
+                    handle.write(data)
+            if written != size:
+                raise RuntimeError("Authenticated range ended before its declared size")
+            return written
+        finally:
+            response.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=lanes, thread_name_prefix="colab-proxy") as pool:
+            completed = list(pool.map(lambda item: download_range(*item), ranges))
+        if sum(completed) != wire_bytes or _file_sha256(destination) != wire_checksum:
+            raise RuntimeError("Parallel authenticated download checksum mismatch")
+        with destination.open("r+b") as completed_handle:
+            completed_handle.flush()
+            os.fsync(completed_handle.fileno())
+        return lanes
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
+
+
 def _decode_download_wire_file(
     source: Path,
     destination: Path,
@@ -855,52 +940,9 @@ class ColabManager:
         _secure_permissions(self.sync_history_path, 0o600)
 
     def _preferred_transfer_transport(self, direction: str, requested: str, wire_bytes: int) -> str:
-        """Use measured bulk throughput as an automatic WebRTC circuit breaker."""
-        if requested != "auto" or wire_bytes < p2p_min_bytes():
-            return requested
-        try:
-            records = json.loads(self.sync_history_path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return requested
-        bulk = [
-            item
-            for item in records
-            if item.get("direction") == direction
-            and int(item.get("wire_bytes", 0)) >= p2p_min_bytes()
-        ]
-        failures = [
-            item
-            for item in bulk
-            if item.get("transport") == "webrtc" and item.get("status") == "failed"
-        ]
-        if failures:
-            try:
-                failed_at = datetime.datetime.fromisoformat(str(failures[-1]["observed_at"]))
-            except (KeyError, TypeError, ValueError):
-                failed_at = datetime.datetime.now(datetime.UTC)
-            if datetime.datetime.now(datetime.UTC) - failed_at < datetime.timedelta(hours=6):
-                return "kernel"
-        p2p_samples = [
-            float(item["mib_per_second"])
-            for item in bulk
-            if item.get("transport") == "webrtc"
-            and item.get("status") != "failed"
-            and float(item.get("mib_per_second", 0)) > 0
-        ][-5:]
-        proxy_samples = [
-            float(item["mib_per_second"])
-            for item in bulk
-            if item.get("transport") in {None, "kernel_websocket", "authenticated_files_proxy"}
-            and float(item.get("mib_per_second", 0)) > 0
-        ][-20:]
-        if p2p_samples and not proxy_samples:
-            return "kernel"
-        if not p2p_samples or not proxy_samples:
-            return requested
-        p2p_typical = sorted(p2p_samples)[len(p2p_samples) // 2]
-        proxy_typical = sorted(proxy_samples)[len(proxy_samples) // 2]
-        # Direct transport must win clearly enough to repay ICE/DTLS startup.
-        return "webrtc" if p2p_typical >= proxy_typical * 1.10 else "kernel"
+        """Auto is the reliable authenticated fast path; WebRTC is explicit only."""
+        del direction, wire_bytes
+        return "kernel" if requested == "auto" else requested
 
     def _kernel_lock(self, name: str) -> asyncio.Lock:
         with self._kernel_clients_guard:
@@ -2520,27 +2562,17 @@ class ColabManager:
     ) -> dict[str, Any]:
         selected_transport = self._preferred_transfer_transport("push", transport, wire_bytes)
         if should_use_p2p(selected_transport, wire_bytes):
-            try:
-                return await self._parallel_p2p_upload(
-                    source=source,
-                    remote_path=remote_path,
-                    offset=offset,
-                    wire_bytes=wire_bytes,
-                    wire_checksum=wire_checksum,
-                    max_total_bytes=max_total_bytes,
-                    session=session,
-                    lease_token=lease_token,
-                    transfer_timeout_override=None if transport == "webrtc" else 90.0,
-                )
-            except Exception as error:
-                if transport == "webrtc":
-                    raise
-                self._record_transport_failure("push", wire_bytes, error)
-                logger.warning(
-                    "webrtc_upload_fallback session=%s error_type=%s",
-                    session.name,
-                    type(error).__name__,
-                )
+            return await self._parallel_p2p_upload(
+                source=source,
+                remote_path=remote_path,
+                offset=offset,
+                wire_bytes=wire_bytes,
+                wire_checksum=wire_checksum,
+                max_total_bytes=max_total_bytes,
+                session=session,
+                lease_token=lease_token,
+                transfer_timeout_override=None,
+            )
         result = await self._binary_upload_file(source, remote_path, offset, session, lease_token)
         result["transport"] = "kernel_websocket"
         return result
@@ -2774,16 +2806,6 @@ class ColabManager:
                     "transport": "webrtc",
                     "seconds": time.monotonic() - p2p_started,
                 }
-            except Exception as error:
-                destination.unlink(missing_ok=True)
-                if transport == "webrtc":
-                    raise
-                self._record_transport_failure("pull", wire_bytes, error)
-                logger.warning(
-                    "webrtc_download_fallback session=%s error_type=%s",
-                    session.name,
-                    type(error).__name__,
-                )
             finally:
                 if temporary_wire is not None:
                     temporary_wire.unlink(missing_ok=True)
@@ -2801,7 +2823,11 @@ class ColabManager:
             chunk_size,
         )
         return {
-            "transport": "authenticated_files_proxy",
+            "transport": (
+                "authenticated_files_proxy_parallel"
+                if wire_bytes >= 4 * 1024 * 1024
+                else "authenticated_files_proxy"
+            ),
             "seconds": time.monotonic() - proxy_started,
         }
 
@@ -2819,22 +2845,54 @@ class ColabManager:
         chunk_size: int,
     ) -> None:
         for attempt in range(2):
+            temporary_wire: Path | None = None
             try:
-                await asyncio.to_thread(
-                    _raw_download_to_file,
-                    session,
-                    remote_path,
-                    destination,
-                    codec,
-                    content_bytes,
-                    wire_bytes,
-                    wire_checksum,
-                    content_checksum,
-                    max_total_bytes,
-                    chunk_size,
-                )
+                if wire_bytes >= 4 * 1024 * 1024:
+                    wire_destination = destination
+                    if codec == "gzip":
+                        descriptor, temporary_name = tempfile.mkstemp(
+                            prefix="colab-mcp-proxy-", suffix=".gz"
+                        )
+                        os.close(descriptor)
+                        temporary_wire = Path(temporary_name)
+                        wire_destination = temporary_wire
+                    await asyncio.to_thread(
+                        _parallel_proxy_download_to_file,
+                        session,
+                        remote_path,
+                        wire_destination,
+                        wire_bytes,
+                        wire_checksum,
+                        chunk_size,
+                    )
+                    if codec == "gzip":
+                        await asyncio.to_thread(
+                            _decode_download_wire_file,
+                            wire_destination,
+                            destination,
+                            content_bytes,
+                            content_checksum,
+                            max_total_bytes,
+                        )
+                    elif content_bytes != wire_bytes or content_checksum != wire_checksum:
+                        raise RuntimeError("Uncompressed proxy metadata is inconsistent")
+                else:
+                    await asyncio.to_thread(
+                        _raw_download_to_file,
+                        session,
+                        remote_path,
+                        destination,
+                        codec,
+                        content_bytes,
+                        wire_bytes,
+                        wire_checksum,
+                        content_checksum,
+                        max_total_bytes,
+                        chunk_size,
+                    )
                 return
             except requests.RequestException:
+                destination.unlink(missing_ok=True)
                 if attempt:
                     raise
                 refreshed = await self._refresh_runtime_proxy(session)
@@ -2843,6 +2901,9 @@ class ColabManager:
                     session.name,
                     refreshed,
                 )
+            finally:
+                if temporary_wire is not None:
+                    temporary_wire.unlink(missing_ok=True)
 
     async def _remote_stat_or_none(
         self,

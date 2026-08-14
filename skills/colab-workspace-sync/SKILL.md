@@ -24,10 +24,11 @@ Use only `colab_workspace_sync` for ordinary file movement. Do not read, write, 
 - Let the verified bundle delta path batch changed source files, skip identical SHA-256 content,
   and atomically replace each published file.
 - Expect compression to help text/source but not already-compressed checkpoints.
-- Keep `transport="auto"` unless the user explicitly requires one path. Auto uses WebRTC only for
-  bulk data, records verified per-direction throughput, and circuit-breaks to the authenticated
-  proxy when peer transfer is slower or fails. Use `transport="webrtc"` for an intentional
-  ICE/TURN diagnostic and `transport="kernel"` for a deterministic proxy transfer.
+- Keep `transport="auto"` unless the user explicitly requests a topology diagnostic. Auto directly
+  uses native binary kernel-websocket upload and concurrent authenticated range download; it does
+  not speculatively attempt WebRTC or silently fall back. Use `transport="webrtc"` only for an
+  intentional ICE/TURN diagnostic. `transport="kernel"` is an explicit alias for auto's
+  authenticated path.
 - Do not expect deletion: destination-only files are deliberately preserved.
 
 If synchronization is interrupted before submission, retry with the same lease. If a transfer ID or staging path is returned, preserve it for recovery. If the fingerprint changes, abandon that staging record and restore onto a new runtime. Never release compute until returned local hashes are verified.

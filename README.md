@@ -251,21 +251,19 @@ wire SHA-256 values are verified, and results distinguish logical `total_bytes` 
 In `auto` mode, already-compressed image, audio, video, and archive formats bypass the expensive
 gzip trial pass. `colab_workspace_sync` is the single supported upload/download API;
 its direction selects push or pull while process export remains a lifecycle-specific operation.
-Bulk data can use an end-to-end encrypted WebRTC data channel after the guarded kernel connection
+Explicit diagnostics can use an end-to-end encrypted WebRTC data channel after the guarded kernel connection
 installs a pinned, checksum-verified endpoint script in the owned runtime. ICE signaling remains
 inside the authenticated kernel channel; file bytes then travel directly between peers, or through
 an explicitly configured TURN relay. The endpoint revalidates the runtime incarnation and operation
 lease before and after transfer. SHA-256 verification, resumable staging, size/file-count bounds,
 and atomic publication are identical for every transport.
 
-`transport="auto"` is the default. Files below 4 MiB use the authenticated Colab path to avoid
-ICE/DTLS startup. For bulk files, auto samples WebRTC and records verified throughput by direction;
-once both paths have measurements it keeps WebRTC only when its median is at least 10% faster.
-Connection or transfer failure falls back without publishing peer bytes and opens a six-hour
-per-direction circuit breaker before auto probes the peer path again. Use
-`transport="webrtc"` to require the peer path or `transport="kernel"` to disable it. Results report
-`data_transport` and per-file transport values. WebRTC is topology-dependent and is not assumed to
-be faster merely because a connection succeeds.
+`transport="auto"` is the default reliable path. Uploads use native binary kernel-websocket
+buffers; bulk downloads use concurrent authenticated HTTP byte ranges, with per-range bounds and a
+final SHA-256 check before publication. It does not first attempt a topology-dependent transport or
+silently fall back. Use `transport="webrtc"` only to require and diagnose the peer path;
+`transport="kernel"` is an explicit alias for the authenticated path. Results report
+`data_transport` and per-file transport values.
 
 The default ICE configuration uses public STUN for discovery only. Production TURN requires your
 own short-lived authenticated credentials; no open relay credentials are embedded. Configure a

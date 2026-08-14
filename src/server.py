@@ -82,7 +82,7 @@ CompressionMode = Annotated[
 TransferTransport = Annotated[
     Literal["auto", "webrtc", "kernel"],
     Field(
-        description="auto uses lease-bound WebRTC for bulk data and safely falls back; webrtc requires it; kernel uses the authenticated Colab proxy."
+        description="auto uses the reliable authenticated fast path; webrtc explicitly requests the topology-dependent diagnostic path; kernel is an alias for the authenticated path."
     ),
 ]
 CompressionMinBytes = Annotated[
@@ -607,7 +607,7 @@ async def colab_workspace_sync(
         ),
     ] = None,
 ) -> dict:
-    """Incrementally sync with verified WebRTC bulk transfer and safe proxy fallback. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
+    """Incrementally sync through the verified authenticated fast path. WebRTC is explicit only. Destination extras are never deleted; retry confirmed pre-submission failures with the same lease."""
     local = Path(local_folder).expanduser().resolve()
     if direction == "push" and not local.is_dir():
         raise ValueError("local_folder must be an existing directory for push")

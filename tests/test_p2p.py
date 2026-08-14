@@ -10,7 +10,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from src.manager import ColabManager
+from src.manager import (
+    ColabManager,
+    _parallel_proxy_download_to_file,
+    _proxy_download_lanes,
+)
 from src.p2p import (
     P2P_ENDPOINT_SOURCE,
     P2PError,
@@ -57,7 +61,7 @@ def test_auto_transport_has_a_bulk_threshold(monkeypatch):
     assert not should_use_p2p("kernel", 10_000)
 
 
-def test_auto_transport_uses_measured_bulk_circuit_breaker(tmp_path, monkeypatch):
+def test_auto_transport_always_uses_authenticated_fast_path(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("COLAB_MCP_WEBRTC_MIN_BYTES", str(4 * 1024 * 1024))
     manager = ColabManager()
@@ -68,18 +72,16 @@ def test_auto_transport_uses_measured_bulk_circuit_breaker(tmp_path, monkeypatch
     assert manager._preferred_transfer_transport("push", "webrtc", size) == "webrtc"
 
 
-def test_auto_transport_prefers_webrtc_only_after_a_clear_measured_win(tmp_path, monkeypatch):
+def test_auto_transport_does_not_speculate_after_a_peer_win(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_MCP_STATE_DIR", str(tmp_path / "state"))
     manager = ColabManager()
     size = 32 * 1024 * 1024
     manager._record_sync_speed("pull", size, 16, "authenticated_files_proxy")
     manager._record_sync_speed("pull", size, 8, "webrtc")
-    assert manager._preferred_transfer_transport("pull", "auto", size) == "webrtc"
+    assert manager._preferred_transfer_transport("pull", "auto", size) == "kernel"
 
 
-def test_auto_transport_samples_proxy_after_first_peer_result_and_cools_down_failures(
-    tmp_path, monkeypatch
-):
+def test_auto_transport_ignores_peer_history(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_MCP_STATE_DIR", str(tmp_path / "state"))
     manager = ColabManager()
     size = 32 * 1024 * 1024
@@ -89,24 +91,95 @@ def test_auto_transport_samples_proxy_after_first_peer_result_and_cools_down_fai
     assert manager._preferred_transfer_transport("pull", "auto", size) == "kernel"
 
 
-def test_auto_upload_falls_back_but_required_webrtc_does_not(tmp_path, monkeypatch):
+def test_parallel_authenticated_download_uses_verified_ranges(tmp_path, monkeypatch):
+    content = os.urandom(9 * 1024 * 1024 + 31)
+    destination = tmp_path / "download.bin"
+    observed = []
+
+    class Response:
+        status_code = 206
+
+        def __init__(self, start, end):
+            self.payload = content[start : end + 1]
+            self.headers = {"Content-Range": f"bytes {start}-{end}/{len(content)}"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_content(self, chunk_size):
+            for offset in range(0, len(self.payload), chunk_size):
+                yield self.payload[offset : offset + chunk_size]
+
+        def close(self):
+            return None
+
+    def get(_url, *, headers, **_kwargs):
+        value = headers["Range"].removeprefix("bytes=")
+        start, end = (int(item) for item in value.split("-"))
+        observed.append((start, end))
+        return Response(start, end)
+
+    monkeypatch.setattr("src.manager.requests.get", get)
+    session = SimpleNamespace(url="https://runtime.test", token="secret")
+    lanes = _parallel_proxy_download_to_file(
+        session,
+        "/content/payload",
+        destination,
+        len(content),
+        hashlib.sha256(content).hexdigest(),
+        512 * 1024,
+    )
+    assert lanes == _proxy_download_lanes(len(content)) == 3
+    assert len(observed) == lanes
+    assert destination.read_bytes() == content
+
+
+def test_parallel_authenticated_download_rejects_ignored_ranges(tmp_path, monkeypatch):
+    destination = tmp_path / "download.bin"
+
+    class Response:
+        status_code = 200
+        headers = {}
+
+        def raise_for_status(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr("src.manager.requests.get", lambda *_args, **_kwargs: Response())
+    with pytest.raises(RuntimeError, match="did not honor byte ranges"):
+        _parallel_proxy_download_to_file(
+            SimpleNamespace(url="https://runtime.test", token="secret"),
+            "/content/payload",
+            destination,
+            5 * 1024 * 1024,
+            hashlib.sha256(b"").hexdigest(),
+            512 * 1024,
+        )
+    assert not destination.exists()
+
+
+def test_auto_upload_never_attempts_webrtc_and_explicit_failure_is_visible(tmp_path, monkeypatch):
     monkeypatch.setenv("COLAB_MCP_STATE_DIR", str(tmp_path / "state"))
     monkeypatch.setenv("COLAB_MCP_WEBRTC_MIN_BYTES", "0")
     manager = ColabManager()
     source = tmp_path / "wire.bin"
     source.write_bytes(b"verified")
     session = SimpleNamespace(name="runtime")
-    fallback_calls = []
+    peer_calls = []
+    authenticated_calls = []
 
     async def failed_peer(**_kwargs):
+        peer_calls.append(True)
         raise P2PError("injected peer failure")
 
-    async def fallback(*_args):
-        fallback_calls.append(True)
+    async def authenticated(*_args):
+        authenticated_calls.append(True)
         return {"offset": 8, "sha256": hashlib.sha256(b"verified").hexdigest(), "seconds": 1}
 
     monkeypatch.setattr(manager, "_parallel_p2p_upload", failed_peer)
-    monkeypatch.setattr(manager, "_binary_upload_file", fallback)
+    monkeypatch.setattr(manager, "_binary_upload_file", authenticated)
     result = asyncio.run(
         manager._upload_wire_file(
             source,
@@ -121,7 +194,8 @@ def test_auto_upload_falls_back_but_required_webrtc_does_not(tmp_path, monkeypat
         )
     )
     assert result["transport"] == "kernel_websocket"
-    assert fallback_calls == [True]
+    assert authenticated_calls == [True]
+    assert peer_calls == []
     with pytest.raises(P2PError, match="injected"):
         asyncio.run(
             manager._upload_wire_file(
@@ -136,6 +210,8 @@ def test_auto_upload_falls_back_but_required_webrtc_does_not(tmp_path, monkeypat
                 "webrtc",
             )
         )
+    assert authenticated_calls == [True]
+    assert peer_calls == [True]
 
 
 def _run_endpoint_transfer(tmp_path: Path, direction: str, content: bytes) -> dict:

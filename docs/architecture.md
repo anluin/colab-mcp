@@ -91,19 +91,21 @@ gzip-compressed into a unique staging object, transferred in bounded chunks, and
 a second staging object before atomic publication. Both wire bytes and original content are
 size/checksum verified. `auto` chooses compression from measured savings, so file semantics and
 directory layout never change and incompressible data does not pay network expansion.
-For bulk wire objects, the transport selector may bootstrap a pinned aiortc endpoint and exchange
+For explicit WebRTC diagnostics, the transport selector may bootstrap a pinned aiortc endpoint and exchange
 ICE SDP through the already authenticated, lease-guarded kernel channel. The resulting WebRTC data
 channel is reliable and unordered; every binary message carries an absolute range offset so packet
 loss does not impose stream-wide head-of-line blocking. DTLS protects peer content. Upload ranges
 land in isolated staging files and are assembled only after every range and the complete wire hash
 verify. Pull ranges are assembled into a hidden local file under the same checks. Any peer failure
-leaves the original resumable stage untouched and auto mode returns to the authenticated kernel or
-files-proxy transport.
+leaves the original resumable stage untouched and is returned to the caller without changing
+transport.
 
-Transport selection is evidence-based. Owner-only throughput history separates WebRTC from proxy
-samples by direction and considers bulk transfers only. Auto mode requires a clear measured win to
-keep using WebRTC; explicit `webrtc` and `kernel` selections remain deterministic. ICE credentials
-are configuration inputs, not signaling output or process arguments.
+Auto transport is deterministic: native binary kernel-websocket buffers upload bundle bytes and
+concurrent authenticated HTTP ranges download bulk wire files. Each range is bounded and the
+assembled file must match the declared SHA-256 before decoding or publication. Explicit `webrtc`
+remains deterministic and failure-visible for topology diagnostics; `kernel` aliases the
+authenticated auto path. ICE credentials are configuration inputs, not signaling output or process
+arguments.
 Only folder synchronization is public. Low-level filesystem and single-file transfer primitives
 remain internal implementation details. Folder sync is content-hash incremental and intentionally
 does not delete destination-only files; this provides rsync-like update behavior without requiring
